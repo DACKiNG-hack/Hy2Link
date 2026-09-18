@@ -28,14 +28,15 @@
 | 6 | ctrlConn | `h3-ctrl` | Cubic | ICMP + 心跳 |
 
 ## 目录结构
-.
-├── hy-core/ Hysteria2 core（含本地修改）
-├── hy-extras/ Hysteria2 extras（obfs 等）
-├── quic-go/ quic-go（本地锁定版本）
-├── vpn-server/ 服务端（Go + 内嵌 Web 面板）
-└── vpn-tool/ 客户端（Wails + Vue 3）
 
-text
+```
+.
+├── hy-core/        Hysteria2 core（含本地修改）
+├── hy-extras/      Hysteria2 extras（obfs 等）
+├── quic-go/        quic-go（本地锁定版本）
+├── vpn-server/     服务端（Go + 内嵌 Web 面板）
+└── vpn-tool/       客户端（Wails + Vue 3）
+```
 
 ## 快速开始
 
@@ -51,35 +52,43 @@ text
 cd vpn-server
 go build -o hy2link-server.exe .
 ./hy2link-server.exe
+```
+
 首次启动自动创建：
 
-config/server.json — 服务端配置
+- `config/server.json` — 服务端配置
+- `certs/selfsigned.crt` / `certs/selfsigned.key` — 自签证书
+- 管理面板：`http://localhost:8444`
 
-certs/selfsigned.crt / certs/selfsigned.key — 自签证书
+### 编译客户端
 
-管理面板：http://localhost:8444
-
-编译客户端
-bash
+```bash
 cd vpn-tool
 wails build
-产物在 build/bin/ 下。
+```
 
-配置说明
-服务端
-关键配置项（server.json）：
+产物在 `build/bin/` 下。
 
-字段	说明
-port	QUIC 监听端口
-obfsEnabled / obfsPassword	Salamander 混淆开关和预共享密钥
-tcpSplitEnabled / tcpSplitPorts	TCP 端口拆分
-udpReliablePorts	匹配 UDP 端口范围
-udpUnreliablePorts	对战 UDP 端口范围
-serverTunEnabled	服务端 TUN 开关
-客户端
-支持 .hy2 配置文件双击导入：
+## 配置说明
 
-json
+### 服务端
+
+关键配置项（`server.json`）：
+
+| 字段 | 说明 |
+|------|------|
+| `port` | QUIC 监听端口 |
+| `obfsEnabled` / `obfsPassword` | Salamander 混淆开关和预共享密钥 |
+| `tcpSplitEnabled` / `tcpSplitPorts` | TCP 端口拆分 |
+| `udpReliablePorts` | 匹配 UDP 端口范围 |
+| `udpUnreliablePorts` | 对战 UDP 端口范围 |
+| `serverTunEnabled` | 服务端 TUN 开关 |
+
+### 客户端
+
+支持 `.hy2` 配置文件双击导入：
+
+```json
 {
   "v": 1,
   "type": "hy2link",
@@ -91,36 +100,44 @@ json
   "obfsPassword": "your-obfs-password",
   "skipCertVerify": false
 }
-抗封锁设计
+```
+
+## 抗封锁设计
+
 三层混淆叠加，对抗不同维度的深度包检测：
 
-1.数据包混淆 — Salamander，无 PSK 无法还原任何 QUIC 特征
+1. **数据包混淆** — Salamander，无 PSK 无法还原任何 QUIC 特征
+2. **TLS 握手伪装** — ALPN 使用标准 HTTP/3 名字
+3. **流量模式打散** — 按应用类型拆分到多条 QUIC 连接
 
-2.TLS 握手伪装 — ALPN 使用标准 HTTP/3 名字
+## 依赖说明
 
-3.流量模式打散 — 按应用类型拆分到多条 QUIC 连接
+本项目包含以下**本地依赖**（通过 `replace` 指令引用）：
 
-依赖说明
-本项目包含以下本地依赖（通过 replace 指令引用）：
+| 依赖 | 来源 | 说明 |
+|------|------|------|
+| `hy-core/` | [apernet/hysteria](https://github.com/apernet/hysteria) | MIT，**有本地修改** |
+| `hy-extras/` | 同上 | MIT，保留上游 |
+| `quic-go/` | [apernet/quic-go](https://github.com/apernet/quic-go) | MIT，版本锁定 |
 
-依赖	来源	说明
-hy-core/	apernet/hysteria	MIT，有本地修改
-hy-extras/	同上	                MIT，保留上游
-quic-go/	apernet/quic-go	    MIT，版本锁定
-许可证
-本项目采用 MIT 许可证，详见 LICENSE。
+## hy-core 本地修改说明
+
+本项目基于 Hysteria2 上游代码，`hy-core/` 目录包含以下本地修改：
+
+- （待补充）
+
+## 许可证
+
+本项目采用 MIT 许可证，详见 [LICENSE](LICENSE)。
 
 第三方依赖保留各自原许可证：
 
-Hysteria2 — MIT License
+- Hysteria2 — MIT License
+- quic-go — MIT License
 
-quic-go — MIT License
+## 致谢
 
-致谢
-Hysteria2 — 核心协议栈
-
-quic-go — QUIC 实现
-
-Wails — 桌面客户端框架
-
-Vue 3 — 前端框架
+- [Hysteria2](https://github.com/apernet/hysteria) — 核心协议栈
+- [quic-go](https://github.com/quic-go/quic-go) — QUIC 实现
+- [Wails](https://wails.io/) — 桌面客户端框架
+- [Vue 3](https://vuejs.org/) — 前端框架
