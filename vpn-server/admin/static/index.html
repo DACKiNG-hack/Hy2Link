@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Hy2Link · Service Console</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://unpkg.com/vue-i18n@9/dist/vue-i18n.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="i18n.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+    <div v-if="!initChecked" class="auth-wrap">
+        <div class="auth-card">
+            <div class="auth-loading">{{ $t('init.checking') }}</div>
+        </div>
+    </div>
+
+    <div v-else-if="!initialized" class="auth-wrap">
+        <div class="auth-card">
+            <div class="auth-brand">
+                <img src="logo.png" alt="Hy2Link" />
+                <div>
+                    <div class="auth-title">Hy2Link</div>
+                    <div class="auth-sub">{{ $t('init.title') }}</div>
+                </div>
+            </div>
+
+            <div class="auth-hint">
+                {{ $t('init.welcome') }}<br/>
+                {{ $t('init.setup') }}
+            </div>
+
+            <input v-model="setupForm.username" type="text" :placeholder="$t('init.username')" @keyup.enter="doSetup" autocomplete="username" />
+            <input v-model="setupForm.password" type="password" :placeholder="$t('init.password')" @keyup.enter="doSetup" autocomplete="new-password" />
+            <input v-model="setupForm.confirm" type="password" :placeholder="$t('init.confirm')" @keyup.enter="doSetup" autocomplete="new-password" />
+            <button class="btn btn-primary btn-block" @click="doSetup" :disabled="setupBusy">{{ setupBusy ? $t('init.creating') : $t('init.create') }}</button>
+            <div v-if="setupMsg" class="auth-msg" :class="setupOk ? 'ok' : 'err'">{{ setupMsg }}</div>
+        </div>
+    </div>
+
+    <div v-else-if="!token" class="auth-wrap">
+        <div class="auth-card">
+            <div class="auth-brand">
+                <img src="logo.png" alt="Hy2Link" />
+                <div>
+                    <div class="auth-title">Hy2Link</div>
+                    <div class="auth-sub">{{ $t('login.subtitle') }}</div>
+                </div>
+            </div>
+
+            <input v-model="loginForm.username" type="text" :placeholder="$t('login.username')" @keyup.enter="login" autocomplete="username" />
+            <input v-model="loginForm.password" type="password" :placeholder="$t('login.password')" @keyup.enter="login" autocomplete="current-password" />
+            <button class="btn btn-primary btn-block" @click="login" :disabled="logging">{{ logging ? $t('login.logging') : $t('login.submit') }}</button>
+            <div v-if="loginMsg" class="auth-msg" :class="loginOk ? 'ok' : 'err'">{{ loginMsg }}</div>
+
+            <div class="auth-lang">
+                <div class="lang-switch">
+                    <button class="lang-btn" @click="langOpen = !langOpen">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="2" y1="12" x2="22" y2="12"/>
+                            <path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/>
+                        </svg>
+                        <span>{{ currentLangLabel }}</span>
+                    </button>
+                    <div v-if="langOpen" class="lang-menu">
+                        <button v-for="l in languages" :key="l.code"
+                                class="lang-option"
+                                :class="{ active: locale === l.code }"
+                                @click="changeLang(l.code)">
+                            <span class="lang-check" v-if="locale === l.code">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                    <polyline points="20 6 9 17 4 12"/>
+                                </svg>
+                            </span>
+                            <span v-else class="lang-check-empty"></span>
+                            <span>{{ l.label }}</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div v-else class="app">
+        <header class="topbar">
+            <div class="brand">
+                <img class="brand-logo" src="logo.png" alt="Hy2Link" />
+                <span class="brand-name">Hy2Link</span>
+                <span class="brand-ver">v{{ version }}</span>
+            </div>
+
+            <div class="topbar-right">
+                <span class="run-chip" :class="server.running ? 'on' : 'off'">
+                    <span class="run-dot"></span>
+                    {{ server.running ? $t('topbar.running') : $t('topbar.stopped') }}
+                </span>
+
+                <div class="lang-switch">
+                    <button class="lang-btn" @click="langOpen = !langOpen">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="2" y1="12" x2="22" y2="12"/>
+                            <path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/>
+                        </svg>
+                        <span>{{ currentLangLabel }}</span>
+                    </button>
+                    <div v-if="langOpen" class="lang-menu">
+                        <button v-for="l in languages" :key="l.code"
+                                class="lang-option"
+                                :class="{ active: locale === l.code }"
+                                @click="changeLang(l.code)">
+                            <span class="lang-check" v-if="locale === l.code">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                    <polyline points="20 6 9 17 4 12"/>
+                                </svg>
+                            </span>
+                            <span v-else class="lang-check-empty"></span>
+                            <span>{{ l.label }}</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="user-chip">
+                    <span class="user-avatar">{{ (currentUser || '?').charAt(0).toUpperCase() }}</span>
+                    <span class="user-name">{{ currentUser }}</span>
+                </div>
+                <button class="btn btn-ghost btn-sm" @click="logout">{{ $t('topbar.logout') }}</button>
+            </div>
+        </header>
+
+        <div class="app-body">
+            <nav class="nav">
+                <button class="nav-item" :class="{ active: tab==='server' }" @click="tab='server'">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="2" y="3" width="20" height="14" rx="2"/>
+                        <line x1="8" y1="21" x2="16" y2="21"/>
+                        <line x1="12" y1="17" x2="12" y2="21"/>
+                    </svg>
+                    <span>{{ $t('nav.server') }}</span>
+                </button>
+                <button class="nav-item" :class="{ active: tab==='cert' }" @click="tab='cert'">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="11" width="18" height="11" rx="2"/>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                    <span>{{ $t('nav.cert') }}</span>
+                </button>
+                <button class="nav-item" :class="{ active: tab==='clients' }" @click="tab='clients'">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+                        <circle cx="9" cy="7" r="4"/>
+                        <path d="M23 21v-2a4 4 0 00-3-3.87"/>
+                        <path d="M16 3.13a4 4 0 010 7.75"/>
+                    </svg>
+                    <span>{{ $t('nav.clients') }}</span>
+                    <span v-if="clients.length" class="nav-badge">{{ clients.length }}</span>
+                </button>
+                <button class="nav-item" :class="{ active: tab==='users' }" @click="tab='users'">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2"/>
+                        <circle cx="9" cy="7" r="4"/>
+                        <line x1="19" y1="8" x2="19" y2="14"/>
+                        <line x1="22" y1="11" x2="16" y2="11"/>
+                    </svg>
+                    <span>{{ $t('nav.users') }}</span>
+                </button>
+                <button class="nav-item" :class="{ active: tab==='settings' }" @click="tab='settings'">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"/>
+                        <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/>
+                    </svg>
+                    <span>{{ $t('nav.settings') }}</span>
+                </button>
+                <button class="nav-item" :class="{ active: tab==='about' }" @click="tab='about'">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10"/>
+                        <line x1="12" y1="16" x2="12" y2="12"/>
+                        <line x1="12" y1="8" x2="12.01" y2="8"/>
+                    </svg>
+                    <span>{{ $t('nav.about') }}</span>
+                </button>
+            </nav>
+
+            <main class="main">
+
+                <template v-if="tab==='server'">
+                    <div class="page-head">
+                        <h1>{{ $t('server.title') }}</h1>
+                        <p>{{ $t('server.desc') }}</p>
+                    </div>
+
+                    <div class="stat-row">
+                        <div class="stat-card">
+                            <div class="stat-label">{{ $t('server.state') }}</div>
+                            <div class="stat-value" :class="server.running ? 'ok' : 'idle'">
+                                {{ server.running ? $t('topbar.running') : $t('topbar.stopped') }}
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">{{ $t('server.uptime') }}</div>
+                            <div class="stat-value">{{ server.running ? formatUptime(server.uptime) : '—' }}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">{{ $t('server.port') }}</div>
+                            <div class="stat-value mono">{{ server.config?.port || '—' }}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">{{ $t('server.online') }}</div>
+                            <div class="stat-value">{{ clients.length }}</div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-body row-actions">
+                            <button class="btn btn-primary" @click="startServer" :disabled="server.running || busy">{{ $t('server.startBtn') }}</button>
+                            <button class="btn btn-danger" @click="stopServer" :disabled="!server.running || busy">{{ $t('server.stopBtn') }}</button>
+                            <button class="btn btn-ghost" @click="restartServer" :disabled="busy">{{ $t('server.restartBtn') }}</button>
+                            <span class="inline-hint" :class="{ err: server.lastError }">
+                                {{ busy ? $t('server.busy') : (server.lastError ? $t('server.error') + ': ' + server.lastError : '') }}
+                            </span>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head">
+                            <h2>{{ $t('monitor.title') }}</h2>
+                            <span class="card-desc">{{ $t('monitor.range') }}</span>
+                        </div>
+                        <div class="card-body">
+                            <div class="chart-grid">
+                                <div class="chart-card">
+                                    <div class="chart-label">{{ $t('monitor.onlineChart') }}</div>
+                                    <div class="chart-canvas"><canvas ref="onlineChart"></canvas></div>
+                                </div>
+                                <div class="chart-card">
+                                    <div class="chart-label">{{ $t('monitor.trafficChart') }}</div>
+                                    <div class="chart-canvas"><canvas ref="trafficChart"></canvas></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head">
+                            <h2>{{ $t('config.title') }}</h2>
+                            <div class="card-head-right">
+                                <span v-if="server.running" class="tag">{{ $t('config.readonly') }}</span>
+                                <span v-else-if="dirty" class="tag warn">{{ $t('config.unsaved') }}</span>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div class="form-grid">
+                                <div class="field">
+                                    <label>{{ $t('config.port') }}</label>
+                                    <input type="number" v-model.lazy.number="cfg.port" :disabled="server.running" min="1" max="65535" />
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('config.ipStart') }}</label>
+                                    <input type="text" v-model.lazy="cfg.ipPoolStart" :disabled="server.running" placeholder="192.168.30.11" />
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('config.ipEnd') }}</label>
+                                    <input type="text" v-model.lazy="cfg.ipPoolEnd" :disabled="server.running" placeholder="192.168.30.255" />
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('config.mask') }}</label>
+                                    <input type="text" v-model.lazy="cfg.subnetMask" :disabled="server.running" placeholder="255.255.255.0" />
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('config.minVer') }}</label>
+                                    <input type="text" v-model.lazy="cfg.minClientVersion" :disabled="server.running" :placeholder="$t('config.verPlaceholder')" />
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('config.maxVer') }}</label>
+                                    <input type="text" v-model.lazy="cfg.maxClientVersion" :disabled="server.running" :placeholder="$t('config.verPlaceholder')" />
+                                </div>
+                            </div>
+                            <p class="field-hint">{{ $t('config.verHint') }}</p>
+
+                            <div class="divider"></div>
+
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('config.autoStart') }}</div>
+                                    <div class="switch-desc">{{ $t('config.autoStartDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="cfg.autoStart" :disabled="server.running" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+
+                            <div class="divider"></div>
+
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('config.tcpSplit') }}</div>
+                                    <div class="switch-desc">{{ $t('config.tcpSplitDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="cfg.tcpSplitEnabled" :disabled="server.running" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <div v-if="cfg.tcpSplitEnabled" class="field mt-12">
+                                <label>{{ $t('config.tcpSplitPorts') }}</label>
+                                <input type="text" v-model.lazy="cfg.tcpSplitPortsInput" :disabled="server.running" :placeholder="$t('config.tcpSplitPlaceholder')" />
+                                <p class="field-hint">{{ $t('config.tcpSplitHint') }}</p>
+                            </div>
+
+                            <div class="divider"></div>
+
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('config.udpReliable') }}</div>
+                                    <div class="switch-desc">{{ $t('config.udpReliableDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="cfg.udpReliableEnabled" :disabled="server.running" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <div v-if="cfg.udpReliableEnabled" class="field mt-12">
+                                <label>{{ $t('config.udpReliablePorts') }}</label>
+                                <input type="text" v-model.lazy="cfg.udpReliablePortsInput" :disabled="server.running" :placeholder="$t('config.udpReliablePlaceholder')" />
+                            </div>
+
+                            <div class="divider"></div>
+
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('config.udpUnreliable') }}</div>
+                                    <div class="switch-desc">{{ $t('config.udpUnreliableDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="cfg.udpUnreliableEnabled" :disabled="server.running" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <div v-if="cfg.udpUnreliableEnabled" class="field mt-12">
+                                <label>{{ $t('config.udpUnreliablePorts') }}</label>
+                                <input type="text" v-model.lazy="cfg.udpUnreliablePortsInput" :disabled="server.running" :placeholder="$t('config.udpUnreliablePlaceholder')" />
+                            </div>
+
+                            <div class="divider"></div>
+
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('config.obfs') }}</div>
+                                    <div class="switch-desc">{{ $t('config.obfsDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" id="obfsEnabled" v-model="cfg.obfsEnabled" :disabled="server.running" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <div v-if="cfg.obfsEnabled" class="field mt-12">
+                                <label>{{ $t('config.obfsPsk') }}</label>
+                                <div class="input-with-btn">
+                                    <input type="text" v-model.lazy="cfg.obfsPassword" :disabled="server.running" :placeholder="$t('config.obfsPskPlaceholder')" />
+                                    <button
+                                            class="btn btn-ghost btn-sm"
+                                            type="button"
+                                            :disabled="server.running"
+                                            @click="generateObfsPassword"
+                                            :title="$t('config.obfsGenerate')"
+                                    >
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px;">
+                                            <path d="M21 2v6h-6"/>
+                                            <path d="M3 12a9 9 0 0115-6.7L21 8"/>
+                                            <path d="M3 22v-6h6"/>
+                                            <path d="M21 12a9 9 0 01-15 6.7L3 16"/>
+                                        </svg>
+                                        {{ $t('config.obfsGenerate') }}
+                                    </button>
+                                </div>
+                                <p class="field-hint">{{ $t('config.obfsPskHint') }}</p>
+                            </div>
+
+                            <div class="divider"></div>
+
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('config.serverTun') }}</div>
+                                    <div class="switch-desc">{{ $t('config.serverTunDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="cfg.serverTunEnabled" :disabled="server.running" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <div v-if="cfg.serverTunEnabled" class="form-grid mt-12">
+                                <div class="field">
+                                    <label>{{ $t('config.serverTunIp') }}</label>
+                                    <input type="text" v-model.lazy="cfg.serverTunIP" :disabled="server.running" :placeholder="$t('config.serverTunIpPlaceholder')" />
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('config.serverTunMask') }}</label>
+                                    <input type="text" v-model.lazy="cfg.serverTunMask" :disabled="server.running" :placeholder="$t('config.serverTunMaskPlaceholder')" />
+                                </div>
+                            </div>
+
+                            <div class="actions-footer">
+                                <button class="btn btn-primary" @click="saveConfig" :disabled="server.running || busy">{{ $t('config.saveBtn') }}</button>
+                                <button class="btn btn-ghost" @click="resetConfig" :disabled="server.running || busy || !dirty">{{ $t('config.resetBtn') }}</button>
+                                <span v-if="dirty" class="inline-hint warn">{{ $t('config.dirty') }}</span>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
+                <template v-if="tab==='cert'">
+                    <div class="page-head">
+                        <h1>{{ $t('cert.title') }}</h1>
+                        <p>{{ $t('cert.desc') }}</p>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head">
+                            <h2>{{ $t('cert.current') }}</h2>
+                            <div class="card-head-right">
+                                <span class="tag" :class="{
+                                    ok: certInfo && certInfo.daysLeft > 30,
+                                    warn: certInfo && certInfo.daysLeft > 0 && certInfo.daysLeft <= 30,
+                                    err: certInfo && certInfo.daysLeft <= 0
+                                }">
+                                    {{ certInfo ? $t('cert.daysLeft', { days: certInfo.daysLeft }) : $t('cert.notLoaded') }}
+                                </span>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div v-if="certInfo" class="cert-grid">
+                                <div class="cert-item">
+                                    <div class="cert-key">{{ $t('cert.mode') }}</div>
+                                    <div class="cert-val">
+                                        <span v-if="certInfo.mode === 'selfsigned'">{{ $t('cert.selfSigned') }}</span>
+                                        <span v-else-if="certInfo.mode === 'acme'">{{ $t('cert.ca') }}</span>
+                                        <span v-else>{{ certInfo.mode }}</span>
+                                    </div>
+                                </div>
+                                <div class="cert-item">
+                                    <div class="cert-key">{{ $t('cert.issuer') }}</div>
+                                    <div class="cert-val mono sm">{{ certInfo.issuer }}</div>
+                                </div>
+                                <div class="cert-item">
+                                    <div class="cert-key">{{ $t('cert.cn') }}</div>
+                                    <div class="cert-val mono sm">{{ (certInfo.dnsNames || []).join(', ') || '—' }}</div>
+                                </div>
+                                <div class="cert-item">
+                                    <div class="cert-key">{{ $t('cert.validity') }}</div>
+                                    <div class="cert-val sm">{{ formatDate(certInfo.notBefore) }} ~ {{ formatDate(certInfo.notAfter) }}</div>
+                                </div>
+                                <div class="cert-item cert-item-full">
+                                    <div class="cert-key">
+                                        {{ $t('cert.fingerprint') }}
+                                        <button class="btn btn-ghost btn-xs" @click="copyFingerprint">{{ $t('cert.copy') }}</button>
+                                    </div>
+                                    <div class="cert-val mono sm break-all">{{ certInfo.fingerprint }}</div>
+                                    <p v-if="certInfo.mode === 'selfsigned'" class="field-hint">{{ $t('cert.selfSignedHint') }}</p>
+                                </div>
+                            </div>
+                            <div v-else class="empty-sm">
+                                <span v-if="certStatusError" class="err">{{ certStatusError }}</span>
+                                <span v-else>{{ $t('cert.loading') }}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head">
+                            <h2>{{ $t('cert.config') }}</h2>
+                            <div class="card-head-right">
+                                <span v-if="certDirty" class="tag warn">{{ $t('cert.unsaved') }}</span>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <label class="radio-row">
+                                <input type="radio" name="certMode" value="selfsigned" v-model="certCfg.mode" :disabled="server.running" />
+                                <div>
+                                    <div class="radio-name">{{ $t('cert.selfSignedRadio') }}</div>
+                                    <div class="radio-desc">{{ $t('cert.selfSignedRadioDesc') }}</div>
+                                </div>
+                            </label>
+                            <label class="radio-row">
+                                <input type="radio" name="certMode" value="acme" v-model="certCfg.mode" :disabled="server.running" />
+                                <div>
+                                    <div class="radio-name">{{ $t('cert.acmeRadio') }}</div>
+                                    <div class="radio-desc">{{ $t('cert.acmeRadioDesc') }}</div>
+                                </div>
+                            </label>
+
+                            <div class="divider"></div>
+
+                            <div v-if="certCfg.mode === 'selfsigned'" class="form-grid">
+                                <div class="field">
+                                    <label>{{ $t('cert.cnLabel') }}</label>
+                                    <input type="text" v-model.lazy="certCfg.selfSignedCN" :disabled="server.running" :placeholder="$t('cert.cnPlaceholder')" />
+                                    <p class="field-hint">{{ $t('cert.cnHint') }}</p>
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('cert.daysLabel') }}</label>
+                                    <input type="number" v-model.lazy.number="certCfg.selfSignedDays" :disabled="server.running" min="1" max="36500" />
+                                </div>
+                            </div>
+
+                            <div v-if="certCfg.mode === 'acme'" class="form-grid">
+                                <div class="field">
+                                    <label>{{ $t('cert.domain') }}</label>
+                                    <input type="text" v-model.lazy="certCfg.acmeDomain" :disabled="server.running" :placeholder="$t('cert.domainPlaceholder')" />
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('cert.email') }}</label>
+                                    <input type="text" v-model.lazy="certCfg.acmeEmail" :disabled="server.running" :placeholder="$t('cert.emailPlaceholder')" />
+                                </div>
+                            </div>
+
+                            <p class="field-hint">{{ $t('cert.restartHint') }}</p>
+
+                            <div class="actions-footer">
+                                <button class="btn btn-primary" @click="saveCertConfig" :disabled="server.running || certBusy">{{ $t('cert.save') }}</button>
+                                <button class="btn btn-ghost" @click="regenerateCert" :disabled="server.running || certCfg.mode !== 'selfsigned' || certBusy">{{ $t('cert.regenBtn') }}</button>
+                                <button class="btn btn-ghost" @click="loadCertConfig" :disabled="certBusy">{{ $t('cert.resetBtn') }}</button>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
+                <template v-if="tab==='clients'">
+                    <div class="page-head">
+                        <h1>{{ $t('clients.title') }}</h1>
+                        <p>{{ $t('clients.desc') }}</p>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head">
+                            <h2>{{ $t('clients.list') }}</h2>
+                            <div class="card-head-right">
+                                <span class="tag">{{ $t('clients.onlineCount', { count: clients.length }) }}</span>
+                            </div>
+                        </div>
+                        <div v-if="!clients.length" class="empty">{{ $t('clients.empty') }}</div>
+                        <div v-else class="table-wrap">
+                            <table>
+                                <thead>
+                                <tr>
+                                    <th>{{ $t('clients.colId') }}</th>
+                                    <th>{{ $t('clients.colMode') }}</th>
+                                    <th>{{ $t('clients.colVip') }}</th>
+                                    <th>{{ $t('clients.colPublicIp') }}</th>
+                                    <th>{{ $t('clients.colPort') }}</th>
+                                    <th>{{ $t('clients.colDuration') }}</th>
+                                    <th>{{ $t('clients.colLatency') }}</th>
+                                    <th>{{ $t('clients.colUp') }}</th>
+                                    <th>{{ $t('clients.colDown') }}</th>
+                                    <th class="col-actions"></th>
+                                </tr>
+                                </thead>
+                                <tbody>
+                                <tr v-for="c in clients" :key="c.username">
+                                    <td class="strong">{{ c.username }}</td>
+                                    <td>
+                                        <span class="tag subtle">{{ c.mode === 'multi' ? $t('clients.multi') : $t('clients.single') }}</span>
+                                    </td>
+                                    <td class="mono ok">{{ c.virtualIP }}</td>
+                                    <td class="mono">{{ parseAddr(c.realAddr).ip }}</td>
+                                    <td class="mono muted">{{ parseAddr(c.realAddr).port }}</td>
+                                    <td class="muted">{{ formatDuration(c.connected) }}</td>
+                                    <td class="mono" :class="latencyClass(c.latencyMs)">{{ latencyText(c.latencyMs) }}</td>
+                                    <td class="mono">{{ formatBytes(c.bytesIn) }}</td>
+                                    <td class="mono">{{ formatBytes(c.bytesOut) }}</td>
+                                    <td class="col-actions">
+                                        <button class="btn btn-danger btn-xs" @click="kick(c.username)">{{ $t('clients.kick') }}</button>
+                                    </td>
+                                </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </template>
+
+                <template v-if="tab==='users'">
+                    <div class="page-head">
+                        <h1>{{ $t('users.title') }}</h1>
+                        <p>{{ $t('users.desc') }}</p>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head">
+                            <h2>{{ $t('users.list') }}</h2>
+                            <div class="card-head-right">
+                                <span class="tag">{{ $t('users.count', { count: users.length }) }}</span>
+                                <button class="btn btn-primary btn-sm" @click="openCreateUser">{{ $t('users.create') }}</button>
+                            </div>
+                        </div>
+                        <div v-if="!users.length" class="empty">{{ $t('users.empty') }}</div>
+                        <div v-else class="table-wrap">
+                            <table>
+                                <thead>
+                                <tr>
+                                    <th>{{ $t('users.colUser') }}</th>
+                                    <th>{{ $t('users.colStatus') }}</th>
+                                    <th>{{ $t('users.colUsed') }}</th>
+                                    <th>{{ $t('users.colQuota') }}</th>
+                                    <th>{{ $t('users.colExpire') }}</th>
+                                    <th>{{ $t('users.colNote') }}</th>
+                                    <th class="col-actions"></th>
+                                </tr>
+                                </thead>
+                                <tbody>
+                                <tr v-for="u in users" :key="u.username">
+                                    <td class="strong">{{ u.username }}</td>
+                                    <td>
+                                        <span v-if="!u.enabled" class="tag err">{{ $t('users.disabled') }}</span>
+                                        <span v-else-if="isExpired(u.expireAt)" class="tag err">{{ $t('users.expired') }}</span>
+                                        <span v-else class="tag ok">{{ $t('users.normal') }}</span>
+                                    </td>
+                                    <td class="mono">{{ formatBytes(u.usedBytes) }}</td>
+                                    <td class="mono muted">{{ u.maxBytes > 0 ? formatBytes(u.maxBytes) : '∞' }}</td>
+                                    <td class="muted mono">{{ u.expireAt && u.expireAt !== '0001-01-01T00:00:00Z' ? formatDate(u.expireAt) : '—' }}</td>
+                                    <td class="muted">{{ u.note || '—' }}</td>
+                                    <td class="col-actions">
+                                        <button class="btn btn-ghost btn-xs" @click="openEditUser(u)">{{ $t('users.edit') }}</button>
+                                        <button class="btn btn-danger btn-xs" @click="deleteUser(u)">{{ $t('users.delete') }}</button>
+                                    </td>
+                                </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </template>
+
+                <template v-if="tab==='settings'">
+                    <div class="page-head">
+                        <h1>{{ $t('settings.title') }}</h1>
+                        <p>{{ $t('settings.desc') }}</p>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head"><h2>{{ $t('settings.globalPwd') }}</h2></div>
+                        <div class="card-body">
+                            <div class="field">
+                                <label>{{ $t('settings.globalPwdLabel') }}</label>
+                                <input type="text" v-model="globalPwd" :placeholder="$t('settings.globalPwdPlaceholder')" />
+                                <p class="field-hint">{{ $t('settings.globalPwdHint') }}</p>
+                            </div>
+                            <div class="actions-footer">
+                                <button class="btn btn-primary" @click="saveGlobalPwd">{{ $t('settings.save') }}</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head"><h2>{{ $t('settings.adminPwd') }}</h2></div>
+                        <div class="card-body">
+                            <div class="form-grid-3">
+                                <div class="field">
+                                    <label>{{ $t('settings.oldPwd') }}</label>
+                                    <input type="password" v-model="pwdForm.oldPassword" :placeholder="$t('settings.oldPwdPlaceholder')" />
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('settings.newPwd') }}</label>
+                                    <input type="password" v-model="pwdForm.newPassword" :placeholder="$t('settings.newPwdPlaceholder')" />
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('settings.confirmPwd') }}</label>
+                                    <input type="password" v-model="pwdForm.confirmPassword" :placeholder="$t('settings.confirmPwdPlaceholder')" />
+                                </div>
+                            </div>
+                            <div class="actions-footer">
+                                <button class="btn btn-primary" @click="changePassword">{{ $t('settings.changePwd') }}</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head">
+                            <h2>{{ $t('settings.geo') }}</h2>
+                            <div class="card-head-right">
+                                <span v-if="geoSaving" class="tag">{{ $t('settings.geoSaving') }}</span>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <p class="field-hint mb-16">{{ $t('settings.geoDesc') }}</p>
+
+                            <div class="form-grid">
+                                <div class="field">
+                                    <label>{{ $t('settings.geoMode') }}</label>
+                                    <select v-model="geo.mode">
+                                        <option value="off">{{ $t('settings.geoModeOff') }}</option>
+                                        <option value="block">{{ $t('settings.geoModeBlock') }}</option>
+                                        <option value="allow">{{ $t('settings.geoModeAllow') }}</option>
+                                    </select>
+                                </div>
+                                <div class="field">
+                                    <label>{{ $t('settings.geoCountries') }}</label>
+                                    <input type="text" v-model.lazy="geoCountriesInput" :placeholder="$t('settings.geoCountriesPlaceholder')" :disabled="geo.mode === 'off'" />
+                                </div>
+                            </div>
+
+                            <div class="switch-row mt-12">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('settings.geoBlockPrivate') }}</div>
+                                    <div class="switch-desc">{{ $t('settings.geoBlockPrivateDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="geo.blockPrivate" :disabled="geo.mode === 'off'" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+
+                            <div class="actions-footer">
+                                <button class="btn btn-primary" @click="saveGeo" :disabled="geoSaving">{{ $t('settings.save') }}</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head">
+                            <h2>{{ $t('settings.perf') }}</h2>
+                            <div class="card-head-right">
+                                <span v-if="perfSaving" class="tag">{{ $t('common.saving') }}</span>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('settings.lowPerf') }}</div>
+                                    <div class="switch-desc">{{ $t('settings.lowPerfDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="perf.lowPerformanceMode" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('settings.highPriority') }}</div>
+                                    <div class="switch-desc">{{ $t('settings.highPriorityDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="perf.highPriority" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('settings.logEnabled') }}</div>
+                                    <div class="switch-desc">{{ $t('settings.logEnabledDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="perf.logEnabled" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <div class="actions-footer">
+                                <button class="btn btn-primary" @click="savePerformance" :disabled="perfSaving">{{ $t('settings.save') }}</button>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
+                <template v-if="tab==='about'">
+                    <div class="page-head">
+                        <h1>{{ $t('about.title') }}</h1>
+                        <p>{{ $t('about.desc') }}</p>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-body about-body">
+                            <div class="about-avatar">
+                                <img src="logo.png" alt="目代キョウコ" />
+                            </div>
+                            <div class="about-name">目代キョウコ</div>
+                            <div class="about-role">{{ $t('about.role') }}</div>
+
+                            <div class="about-links">
+                                <a class="about-link" @click.prevent="openExternal('https://space.bilibili.com/477193400')">
+                                    <span class="about-link-label">Bilibili</span>
+                                    <span class="about-link-value">space.bilibili.com/477193400</span>
+                                </a>
+                                <a class="about-link" @click.prevent="openExternal('https://kingblog.top/')">
+                                    <span class="about-link-label">{{ $t('about.blog') }}</span>
+                                    <span class="about-link-value">kingblog.top</span>
+                                </a>
+                            </div>
+
+                            <div class="about-ver">Hy2Link · v{{ version }} · Service Console</div>
+                        </div>
+                    </div>
+                </template>
+
+            </main>
+        </div>
+    </div>
+
+    <div v-if="editUser" class="modal-overlay" @click.self="editUser=null">
+        <div class="modal">
+            <div class="modal-head">
+                <h3>{{ editUser.creating ? $t('users.modalCreate') : $t('users.modalEdit', { name: editUser.username }) }}</h3>
+            </div>
+            <div class="modal-body">
+                <div class="field">
+                    <label>{{ $t('users.modalUsername') }}</label>
+                    <input type="text" v-model="editUser.username" :disabled="!editUser.creating" />
+                </div>
+                <div class="field">
+                    <label>{{ editUser.creating ? $t('users.modalPassword') : $t('users.modalPasswordEdit') }}</label>
+                    <input type="text" v-model="editUser.password" />
+                </div>
+                <div class="field">
+                    <label>{{ $t('users.modalQuota') }}</label>
+                    <input type="number" v-model.number="editUser.maxGB" min="0" />
+                </div>
+                <div class="field">
+                    <label>{{ $t('users.modalExpire') }}</label>
+                    <input type="datetime-local" v-model="editUser.expireAt" />
+                </div>
+                <div class="field">
+                    <label>{{ $t('users.modalNote') }}</label>
+                    <input type="text" v-model="editUser.note" />
+                </div>
+                <label class="check-row" v-if="!editUser.creating">
+                    <input type="checkbox" v-model="editUser.enabled" />
+                    <span>{{ $t('users.modalEnable') }}</span>
+                </label>
+            </div>
+            <div class="modal-foot">
+                <button class="btn btn-ghost" @click="editUser=null">{{ $t('common.cancel') }}</button>
+                <button class="btn btn-primary" @click="saveUser">{{ $t('common.save') }}</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="javascript.js"></script>
+</body>
+</html>

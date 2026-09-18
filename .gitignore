@@ -1,0 +1,58 @@
+# ===== 运行时证书（绝不提交）=====
+/certs/
+/vpn-server/certs/
+/vpn-tool/certs/
+**/certs/*.pem
+**/certs/*.key
+**/certs/*.crt
+**/certs/*.p12
+**/certs/*.pfx
+!**/testdata/**
+!**/integration_tests/**
+!**/internal/testdata/**
+!**/hysteria/app/internal/http/**
+
+# ===== 运行时日志 =====
+/logs/
+/vpn-server/logs/
+/vpn-tool/logs/
+*.log
+
+# ===== 运行时配置（含密码）=====
+/vpn-server/config/server.json
+/vpn-server/admin/admin.json
+/vpn-server/admin/*.json
+/vpn-server/store/*.json
+!vpn-server/store/example.json
+
+# ===== 编译产物 =====
+*.exe
+*.dll
+*.so
+*.dylib
+!**/wintun/**/*.dll
+!**/assets/wintun/**/*.dll
+/vpn-tool/build/bin/
+/vpn-tool/build/darwin/
+/vpn-tool/frontend/dist/
+/vpn-tool/frontend/.vite/
+/vpn-tool/frontend/.vite-temp/
+
+# ===== 依赖 =====
+node_modules/
+**/node_modules/
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.swp
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 临时 =====
+*.tmp
+*.bak
+*~
