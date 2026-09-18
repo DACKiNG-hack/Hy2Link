@@ -122,9 +122,7 @@ wails build
 
 ## hy-core 本地修改说明
 
-本项目基于 Hysteria2 上游代码，`hy-core/` 目录包含以下本地修改：
-
-- （待补充）
+本项目基于 Hysteria2 上游代码，`hy-core/` ,修改过部分源代码
 
 ## 许可证
 
