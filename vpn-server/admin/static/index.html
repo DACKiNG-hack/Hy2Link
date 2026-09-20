@@ -560,7 +560,7 @@
                                 </tr>
                                 </thead>
                                 <tbody>
-                                <tr v-for="c in clients" :key="c.username">
+                                <tr v-for="c in clients" :key="c.virtualIP">
                                     <td class="strong">{{ c.username }}</td>
                                     <td>
                                         <span class="tag subtle">{{ c.mode === 'multi' ? $t('clients.multi') : $t('clients.single') }}</span>
@@ -573,7 +573,7 @@
                                     <td class="mono">{{ formatBytes(c.bytesIn) }}</td>
                                     <td class="mono">{{ formatBytes(c.bytesOut) }}</td>
                                     <td class="col-actions">
-                                        <button class="btn btn-danger btn-xs" @click="kick(c.username)">{{ $t('clients.kick') }}</button>
+                                        <button class="btn btn-danger btn-xs" @click="kick(c.username, c.virtualIP)">{{ $t('clients.kick') }}</button>
                                     </td>
                                 </tr>
                                 </tbody>
@@ -637,20 +637,6 @@
                     <div class="page-head">
                         <h1>{{ $t('settings.title') }}</h1>
                         <p>{{ $t('settings.desc') }}</p>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-head"><h2>{{ $t('settings.globalPwd') }}</h2></div>
-                        <div class="card-body">
-                            <div class="field">
-                                <label>{{ $t('settings.globalPwdLabel') }}</label>
-                                <input type="text" v-model="globalPwd" :placeholder="$t('settings.globalPwdPlaceholder')" />
-                                <p class="field-hint">{{ $t('settings.globalPwdHint') }}</p>
-                            </div>
-                            <div class="actions-footer">
-                                <button class="btn btn-primary" @click="saveGlobalPwd">{{ $t('settings.save') }}</button>
-                            </div>
-                        </div>
                     </div>
 
                     <div class="card">

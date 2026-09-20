@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -24,6 +25,15 @@ type TUNDevice struct {
 	mask   string
 	mtu    int
 
+	// ⭐ 安全审计 S11：writeBufs 是共享切片，
+	//    而 TunWriteLoop 会用 4 个 worker 并发调用 Write。
+	//    原来的 t.writeBufs[0] = data 是无同步写，会导致
+	//    「A 设好缓冲区、B 又覆盖、A 才真正写出去」→ 错包/丢包。
+	writeMu sync.Mutex
+
+	// readBufs/readSizes 目前只有单个读者（ServerTunReadLoop），
+	// 但仍加锁保护，避免将来新增读者时踩同样的坑。
+	readMu    sync.Mutex
 	readBufs  [][]byte
 	readSizes []int
 	writeBufs [][]byte
@@ -67,6 +77,16 @@ func CreateTUN(name, ip, mask string, mtu int) (*TUNDevice, error) {
 		return nil, err
 	}
 
+	// ⭐ 关键：wintun 的 CreateTUN 接收了 mtu 参数但没有真正应用到网卡上。
+	//    必须在设置 IP 之后用 netsh 显式设置 MTU，否则内核认为 MTU=65535，
+	//    TCP 协商出 MSS=65495，服务端 TUN 转发的包会变成 64KB 巨包，
+	//    进入 QUIC 隧道后被分片，丢一片整包重传。
+	if err := setInterfaceMTU(realName, mtu); err != nil {
+		log.Printf("⚠️ [服务端 TUN] 设置 MTU=%d 失败（继续，性能可能受影响）: %v", mtu, err)
+	} else {
+		log.Printf("✅ [服务端 TUN] 已设置 %s MTU=%d", realName, mtu)
+	}
+
 	if runtime.GOOS == "windows" {
 		time.Sleep(500 * time.Millisecond)
 		if err := addSubnetRoute(realName, ip, mask); err != nil {
@@ -76,8 +96,27 @@ func CreateTUN(name, ip, mask string, mtu int) (*TUNDevice, error) {
 		}
 	}
 
-	log.Printf("✅ [服务端 TUN] 创建成功: %s, IP: %s, 掩码: %s", realName, ip, mask)
+	log.Printf("✅ [服务端 TUN] 创建成功: %s, IP: %s, 掩码: %s, MTU: %d", realName, ip, mask, mtu)
 	return dev, nil
+}
+
+// ⭐ setInterfaceMTU 用 netsh 设置网卡 MTU
+// Windows 上需要管理员权限；store=persistent 让设置在网卡存活期间保持
+// 非 Windows 平台由 CreateTUN/ip link 处理，这里直接返回
+func setInterfaceMTU(ifaceName string, mtu int) error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	cmd := newHiddenCmd("netsh", "interface", "ipv4", "set", "subinterface",
+		ifaceName,
+		fmt.Sprintf("mtu=%d", mtu),
+		"store=persistent",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("netsh 设置 MTU 失败: %v, output=%s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func (t *TUNDevice) setIP(ip, mask string) error {
@@ -205,6 +244,8 @@ func getInterfaceIndex(name string) (int, error) {
 }
 
 func (t *TUNDevice) Read() ([]byte, error) {
+	t.readMu.Lock()
+	defer t.readMu.Unlock()
 	n, err := t.device.Read(t.readBufs, t.readSizes, 0)
 	if err != nil {
 		return nil, err
@@ -216,6 +257,10 @@ func (t *TUNDevice) Read() ([]byte, error) {
 }
 
 func (t *TUNDevice) Write(data []byte) error {
+	// ⭐ 安全审计 S11：串行化对 writeBufs / device.Write 的访问。
+	//    调用方（TunWriteLoop 的多个 worker）不得并发进入这里。
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	t.writeBufs[0] = data
 	_, err := t.device.Write(t.writeBufs, 0)
 	return err

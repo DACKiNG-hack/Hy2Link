@@ -3,6 +3,7 @@ package quic
 //vpn-server\quic\authenticator.go
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net"
@@ -20,6 +21,23 @@ const (
 	cleanupInterval = 5 * time.Minute
 )
 
+// ⭐ 安全审计 S7：DHCP 租约的生命周期管理
+const (
+	// dhcpLeaseTTL 未被数据面认领的租约存活时间。
+	// 正常客户端从拿到 IP 到建立数据面只需几秒；超过这个时间
+	// 说明是「申请了 IP 却从不使用」的行为，应当回收。
+	dhcpLeaseTTL = 5 * time.Minute
+	// leaseReapInterval 租约回收扫描间隔
+	leaseReapInterval = 30 * time.Second
+)
+
+// ⭐ 安全审计 S1：数据面会话（服务端自己记录的身份）
+const (
+	// dataPlaneSessionTTL 认证通过后允许建立数据面的时间窗。
+	// 认证与数据面注册之间只有几秒，10 分钟非常宽松。
+	dataPlaneSessionTTL = 10 * time.Minute
+)
+
 // ⭐ 版本号标记：auth 字符串末尾附加 ":vn=X.Y.Z"
 const versionMarker = ":vn="
 
@@ -31,12 +49,20 @@ type IPAllocator struct {
 	startIP    net.IP
 	endIP      net.IP
 	subnetMask net.IPMask
-	clientIP   map[string]string
 	deviceIP   map[string]string
 
 	// ⭐ P2-1: 反向索引，断线释放 O(1)
 	vipToDevice map[string]string
-	vipToClient map[string]string
+
+	// ⭐ 安全审计 S7：租约表 vip -> 过期时刻。
+	//    零值表示「已被活跃数据面会话占用，不参与回收」。
+	//    客户端自报的 deviceID 无法作为可信身份，但至少要让
+	//    「申请了 IP 却从不建立数据面」的租约自动过期 ——
+	//    否则一个已认证用户只要不断用新的 deviceID 申请，
+	//    就能把整个地址池占满，让所有正常用户无法认证。
+	leases map[string]time.Time
+	// leaseTTL 未被数据面认领的租约存活时间（做成字段便于测试）
+	leaseTTL time.Duration
 }
 
 func NewIPAllocator() *IPAllocator {
@@ -45,18 +71,20 @@ func NewIPAllocator() *IPAllocator {
 	next := make(net.IP, len(start))
 	copy(next, start)
 
-	return &IPAllocator{
+	a := &IPAllocator{
 		usedIPs:     make(map[string]bool),
 		freeIPs:     []string{},
-		clientIP:    make(map[string]string),
 		deviceIP:    make(map[string]string),
 		vipToDevice: make(map[string]string),
-		vipToClient: make(map[string]string),
+		leases:      make(map[string]time.Time),
+		leaseTTL:    dhcpLeaseTTL,
 		startIP:     start,
 		endIP:       end,
 		nextIP:      next,
 		subnetMask:  net.CIDRMask(24, 32),
 	}
+	go a.leaseReapLoop()
+	return a
 }
 
 func (a *IPAllocator) SetIPPool(start, end string) error {
@@ -73,18 +101,20 @@ func (a *IPAllocator) SetIPPool(start, end string) error {
 	copy(a.nextIP, startIP)
 	a.usedIPs = make(map[string]bool)
 	a.freeIPs = []string{}
-	a.clientIP = make(map[string]string)
 	a.deviceIP = make(map[string]string)
 	a.vipToDevice = make(map[string]string)
-	a.vipToClient = make(map[string]string)
+	a.leases = make(map[string]time.Time)
 	log.Printf("IP池已更新: %s - %s", start, end)
 	return nil
 }
 
+// SetSubnetMask 设置子网掩码。
+// ⭐ 安全审计 S19：必须要求 IPv4（To4() != nil），否则 net.IPMask(nil)
+// 会让 GetSubnetMask() 返回 "<nil>" 并被下发到客户端，导致所有客户端连不上。
 func (a *IPAllocator) SetSubnetMask(mask string) error {
 	parsed := net.ParseIP(mask)
-	if parsed == nil {
-		return fmt.Errorf("无效子网掩码: %s", mask)
+	if parsed == nil || parsed.To4() == nil {
+		return fmt.Errorf("无效子网掩码（必须是 IPv4）: %s", mask)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -99,25 +129,16 @@ func (a *IPAllocator) GetSubnetMask() string {
 	return net.IP(a.subnetMask).String()
 }
 
-func (a *IPAllocator) Allocate(clientAddr string) string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if vip, ok := a.clientIP[clientAddr]; ok {
-		return vip
-	}
-	vip := a.pickFreeLocked()
-	if vip == "" {
-		return ""
-	}
-	a.clientIP[clientAddr] = vip
-	a.vipToClient[vip] = clientAddr
-	return vip
-}
-
+// AllocateByDeviceID 按 deviceID 分配（或复用）一个 VIP。
+//
+// ⚠️ 安全审计 S1/S7：deviceID 由客户端自报，**不能作为可信身份**。
+// 它只用于「同一设备重连时拿回同一个地址」。真正的身份校验在
+// AuthorizeDataPlane 里用「QUIC 对端 IP + 用户名」完成。
 func (a *IPAllocator) AllocateByDeviceID(deviceID string) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if vip, ok := a.deviceIP[deviceID]; ok {
+		a.renewLeaseLocked(vip) // ⭐ S7：重复申请时续租
 		return vip
 	}
 	vip := a.pickFreeLocked()
@@ -149,13 +170,91 @@ func (a *IPAllocator) pickFreeLocked() string {
 		return ""
 	}
 	a.usedIPs[vip] = true
+	// ⭐ 安全审计 S7：分配即产生租约，未被数据面认领的会在 TTL 后被回收
+	a.leases[vip] = time.Now().Add(a.leaseTTL)
 	return vip
+}
+
+// ---------- 租约管理（安全审计 S7） ----------
+
+// renewLeaseLocked 续租。已绑定活跃会话（零值）的租约保持不变。
+func (a *IPAllocator) renewLeaseLocked(vip string) {
+	if exp, ok := a.leases[vip]; ok && exp.IsZero() {
+		return
+	}
+	a.leases[vip] = time.Now().Add(a.leaseTTL)
+}
+
+// MarkLeaseActive 把租约标记为「已被活跃数据面会话占用」，之后不再被回收，
+// 直到 ReleaseByVirtualIP 显式释放。
+func (a *IPAllocator) MarkLeaseActive(vip string) {
+	if vip == "" {
+		return
+	}
+	a.mu.Lock()
+	if _, ok := a.leases[vip]; ok {
+		a.leases[vip] = time.Time{}
+	}
+	a.mu.Unlock()
+}
+
+// IsLeased 该 VIP 当前是否已通过 DHCP 租出。
+// ⭐ 安全审计 S1：数据面用它拒绝「客户端凭空捏造」的 VIP ——
+// 只有服务端真的分配过的地址才允许注册。
+func (a *IPAllocator) IsLeased(vip string) bool {
+	if vip == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.usedIPs[vip]
+}
+
+// LeaseCount 当前租约数（监控/日志用）
+func (a *IPAllocator) LeaseCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.leases)
+}
+
+func (a *IPAllocator) leaseReapLoop() {
+	ticker := time.NewTicker(leaseReapInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		a.reapExpiredLeases()
+	}
+}
+
+// reapExpiredLeases 回收「申请了 IP 但一直没建立数据面」的租约。
+// 这是 S7 里「地址池被单个用户打空」的兜底：即使攻击者拿到合法账号，
+// 也只能短暂占用地址，且必须先通过认证。
+func (a *IPAllocator) reapExpiredLeases() {
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	released := 0
+	for vip, exp := range a.leases {
+		if exp.IsZero() || now.Before(exp) {
+			continue // 已绑定活跃会话，或还没到期
+		}
+		log.Printf("♻️ [IP池] 回收过期租约 %s（分配后未建立数据面）", vip)
+		a.releaseVIPLocked(vip)
+		released++
+	}
+	if released > 0 {
+		log.Printf("♻️ [IP池] 本轮回收 %d 个租约，剩余租约 %d 个", released, len(a.leases))
+	}
 }
 
 func (a *IPAllocator) ReleaseByVirtualIP(virtualIP string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.releaseVIPLocked(virtualIP)
+}
 
+// releaseVIPLocked 释放单个 VIP（调用方必须已持有 a.mu）
+func (a *IPAllocator) releaseVIPLocked(virtualIP string) {
 	released := false
 
 	if deviceID, ok := a.vipToDevice[virtualIP]; ok {
@@ -164,38 +263,29 @@ func (a *IPAllocator) ReleaseByVirtualIP(virtualIP string) {
 		released = true
 		log.Printf("♻️ 释放IP %s（设备 %s）", virtualIP, deviceID)
 	}
-	if client, ok := a.vipToClient[virtualIP]; ok {
-		delete(a.vipToClient, virtualIP)
-		delete(a.clientIP, client)
-		released = true
-		log.Printf("♻️ 释放IP %s（客户端 %s）", virtualIP, client)
+
+	// ⭐ 安全审计 S7：租约记录必须一并清掉，
+	//    否则回收循环会反复看到这条记录（内存只增不减）。
+	delete(a.leases, virtualIP)
+
+	if a.usedIPs[virtualIP] {
+		delete(a.usedIPs, virtualIP)
+		a.appendFreeLocked(virtualIP)
+		return
 	}
 
 	if !released {
 		return
 	}
+}
 
-	if a.usedIPs[virtualIP] {
-		delete(a.usedIPs, virtualIP)
-		for _, ip := range a.freeIPs {
-			if ip == virtualIP {
-				return
-			}
+func (a *IPAllocator) appendFreeLocked(virtualIP string) {
+	for _, ip := range a.freeIPs {
+		if ip == virtualIP {
+			return
 		}
-		a.freeIPs = append(a.freeIPs, virtualIP)
 	}
-}
-
-func (a *IPAllocator) GetIP(clientIP string) string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.clientIP[clientIP]
-}
-
-func (a *IPAllocator) GetClientByIP(virtualIP string) string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.vipToClient[virtualIP]
+	a.freeIPs = append(a.freeIPs, virtualIP)
 }
 
 func ipLessOrEqual(a, b net.IP) bool {
@@ -297,6 +387,35 @@ func extractVersionAndStrip(auth string) (string, string) {
 
 // ========== 认证器 ==========
 
+// 数据面授权模型（安全审计 S1）
+//
+// ⭐ 问题背景：数据面（h3-data / h3-ctrl）的注册帧是
+// `类型\n模式\n用户名\nVIP`，**全部由客户端自报**，而这两条连接从不经过
+// 认证器。服务端原来直接采信，于是「不需要口令就能入网」「注册别人的 VIP
+// 就能劫持对方」都成立。
+//
+// ⭐ 现在的模型由两张表组成，全部只依赖服务端侧事实：
+//
+//	authorizedKeys : peerIP\x00用户名 -> 授权到期时刻
+//	   认证成功即写入，数据面注册时刷新。peerIP 来自 QUIC 连接，不可伪造；
+//	   用户名必须真的用正确口令认证过。
+//	vipOwner : VIP -> peerIP\x00用户名
+//	   VIP 必须是服务端真的通过 DHCP 租出过的地址（IPAllocator.IsLeased），
+//	   且一旦被某个 key 占用，别的 key 不能抢占。
+//
+// ⭐ 为什么 key 用「peerIP + 用户名」而不是「每个连接一个会话」：
+// 一个账号**允许被多个客户端共用**（这正是需求）。用 (peerIP, 用户名) 作 key
+// 可以天然支持：
+//   - 不同公网 IP 的多个客户端：key 不同，各自绑定自己的 VIP；
+//   - 同一出口 IP（同一路由器下）的多个客户端：**同一个 key**，各自绑定
+//     自己的 VIP —— 因为 vipOwner 是「VIP -> key」的多对一关系，
+//     一个 key 可以合法拥有多个 VIP。
+//
+// 因此这里不再有「一个会话只能绑一个 VIP」的限制。
+//
+// ⚠️ 残留风险（需要协议升级才能完全消除）：同一个 NAT 后面的两个用户共享
+// 出口 IP，因此 A 可能冒充 B（前提是 B 也刚从同一出口认证过）。
+// 彻底解决需要在注册帧里携带服务端签发的一次性票据。
 type CustomAuthenticator struct {
 	userStore   *store.Store
 	ipAllocator *IPAllocator
@@ -308,6 +427,13 @@ type CustomAuthenticator struct {
 	mu          sync.Mutex
 	failCount   map[string]int
 	bannedUntil map[string]time.Time
+
+	// ⭐ 安全审计 S1：数据面授权表
+	// key = peerIP + "\x00" + username -> 授权到期时刻
+	authorizedKeys map[string]time.Time
+	// ⭐ VIP 归属：vip -> key（一个 key 可以拥有多个 VIP，
+	// 以支持同一账号 / 同一出口 IP 的多客户端并发）
+	vipOwner map[string]string
 }
 
 // ⭐ 签名变更：新增 minVer, maxVer 参数
@@ -320,6 +446,8 @@ func NewCustomAuthenticatorWithAllocator(users *store.Store, allocator *IPAlloca
 		maxClientVersion: strings.TrimSpace(maxVer),
 		failCount:        make(map[string]int),
 		bannedUntil:      make(map[string]time.Time),
+		authorizedKeys:   make(map[string]time.Time),
+		vipOwner:         make(map[string]string),
 	}
 	if !isVersionUnlimited(auth.minClientVersion) || !isVersionUnlimited(auth.maxClientVersion) {
 		log.Printf("🔒 [版本校验] 已启用：客户端版本必须 ∈ [%s, %s]",
@@ -327,8 +455,123 @@ func NewCustomAuthenticatorWithAllocator(users *store.Store, allocator *IPAlloca
 	} else {
 		log.Printf("🔓 [版本校验] 未启用（接受任意版本客户端）")
 	}
+	log.Printf("🔐 [认证] 仅支持多用户模式（用户名:密码），全局密码已移除")
+	log.Printf("👥 [认证] 同一账号允许被多个客户端共用（含同一 NAT 下的多台设备）")
 	auth.startCleanupLoop()
 	return auth
+}
+
+// ========== 数据面授权（安全审计 S1） ==========
+
+func sessionKey(peerIP, username string) string {
+	return peerIP + "\x00" + username
+}
+
+// registerSession 认证成功后登记/刷新数据面授权。
+//
+// ⭐ 只写一个「到期时刻」，不再保存每连接状态 —— 因此同一账号
+// 在同一出口 IP 下的多个客户端天然共享同一条授权记录，互不影响。
+func (a *CustomAuthenticator) registerSession(peerIP, username string) {
+	key := sessionKey(peerIP, username)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.authorizedKeys[key] = time.Now().Add(dataPlaneSessionTTL)
+}
+
+// AuthorizeDataPlane 校验数据面注册帧。
+//
+// 全部使用服务端侧信息：
+//   - peerIP 来自 QUIC 连接，客户端无法伪造；
+//   - 该 (peerIP, 用户名) 必须有一次未过期的成功认证；
+//   - vip 必须是服务端真的通过 DHCP 租出过的地址；
+//   - 该 vip 不能被**别的** key 占用（同一个 key 可以拥有多个 vip，
+//     这样同一账号 / 同一出口 IP 下的多个客户端才能并存）。
+//
+// 返回的 mode 由服务端决定，调用方必须使用它而不是客户端自报值。
+func (a *CustomAuthenticator) AuthorizeDataPlane(peerIP, username, vip string) (mode string, ok bool) {
+	if username == "" || vip == "" {
+		return "", false
+	}
+
+	key := sessionKey(peerIP, username)
+	now := time.Now()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	expireAt, exists := a.authorizedKeys[key]
+	if !exists {
+		return "", false
+	}
+	if now.After(expireAt) {
+		delete(a.authorizedKeys, key)
+		return "", false
+	}
+
+	// VIP 必须是服务端真的分配过的地址（客户端不能凭空捏造）。
+	// 注意：这里必须走 IsLeased()（它自己持 allocator 的锁），
+	// 不能直接读 usedIPs 字段，否则会与 IPAllocator 的锁产生数据竞争。
+	if a.ipAllocator == nil || !a.ipAllocator.IsLeased(vip) {
+		return "", false
+	}
+
+	// 同一个 key 可以拥有多个 VIP；但别的 key 不能抢占已被占用的 VIP。
+	if owner, taken := a.vipOwner[vip]; taken && owner != key {
+		log.Printf("🚫 [安全] VIP %s 已被其它身份占用，拒绝 %s 抢占", vip, key)
+		return "", false
+	}
+	a.vipOwner[vip] = key
+
+	// 续期：客户端保持在线时不会因为 TTL 到期而被踢
+	a.authorizedKeys[key] = now.Add(dataPlaneSessionTTL)
+
+	// 身份一旦与 VIP 绑定，就说明该地址确实在被使用：
+	// 把租约标记为活跃，避免它被回收循环误判为「申请后未使用」。
+	a.ipAllocator.MarkLeaseActive(vip)
+
+	// 全局密码已移除，认证成功的会话一律是多用户模式
+	return "multi", true
+}
+
+// releaseSession 某个数据面连接断开时释放它占用的 VIP。
+//
+// ⭐ 只释放 **这一个** VIP，不影响同一账号/同一出口 IP 下其它客户端的 VIP；
+// 授权记录本身交给 TTL 过期（其它客户端可能还在用）。
+func (a *CustomAuthenticator) releaseSession(peerIP, username, vip string) {
+	if vip == "" {
+		return
+	}
+	key := sessionKey(peerIP, username)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.vipOwner[vip] == key {
+		delete(a.vipOwner, vip)
+	}
+}
+
+// AuthorizedKeyCount 当前有效的授权记录数（监控/日志用）
+func (a *CustomAuthenticator) AuthorizedKeyCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.authorizedKeys)
+}
+
+// BoundVIPCount 当前已绑定的 VIP 数（= 在线数据面连接数，监控/日志用）
+func (a *CustomAuthenticator) BoundVIPCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.vipOwner)
+}
+
+// SessionCount 当前有效的授权记录数（等价于「有多少个不同的出口 IP+账号」）
+func (a *CustomAuthenticator) SessionCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.authorizedKeys)
 }
 
 func displayVer(v string) string {
@@ -349,6 +592,19 @@ func (a *CustomAuthenticator) startCleanupLoop() {
 				if now.After(until) {
 					delete(a.bannedUntil, ip)
 					delete(a.failCount, ip)
+				}
+			}
+			// ⭐ S1：清理过期的数据面授权与已失效的 VIP 归属
+			for key, until := range a.authorizedKeys {
+				if now.After(until) {
+					delete(a.authorizedKeys, key)
+				}
+			}
+			// VIP 归属只在对应租约已经被释放后才清理 ——
+			// 否则会把长连接仍在使用的 VIP 释放掉，让别的身份抢占。
+			for vip := range a.vipOwner {
+				if a.ipAllocator != nil && !a.ipAllocator.IsLeased(vip) {
+					delete(a.vipOwner, vip)
 				}
 			}
 			a.mu.Unlock()
@@ -394,9 +650,10 @@ func (a *CustomAuthenticator) recordSuccess(ip string) {
 	delete(a.bannedUntil, ip)
 }
 
-// parseAuth 解析认证字符串（不含版本段）
-// 有冒号 → 多用户模式，返回 (username, password, true)
-// 无冒号 → 单用户模式，返回 ("", password, false)
+// parseAuth 解析认证字符串（不含版本段）。
+// 有冒号 → 多用户模式，返回 (username, password, true)；
+// 无冒号 → 返回 ("", password, false)。后者已不再被接受
+// （全局密码/单用户模式已移除），但保留该返回值以便日志区分。
 func parseAuth(auth string) (string, string, bool) {
 	if i := strings.Index(auth, ":"); i >= 0 {
 		return auth[:i], auth[i+1:], true
@@ -465,10 +722,14 @@ func (a *CustomAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64
 	// 解析用户名密码
 	username, password, isMultiUser := parseAuth(cleanAuth)
 
-	if isMultiUser {
-		return a.authMultiUser(clientIP, username, password, clientVersion)
+	// ⭐ 全局密码（单用户模式）已移除：所有客户端都必须以
+	// 「用户名:密码」认证，与面板的「用户管理」一一对应。
+	if !isMultiUser {
+		a.recordFailure(clientIP)
+		log.Printf("🚫 [安全] 认证串不含用户名（单用户模式已停用）(来自 %s)", clientIP)
+		return false, ""
 	}
-	return a.authSingleUser(clientIP, password, clientVersion)
+	return a.authMultiUser(clientIP, username, password, clientVersion)
 }
 
 func (a *CustomAuthenticator) authMultiUser(clientIP, username, password, clientVersion string) (bool, string) {
@@ -483,7 +744,7 @@ func (a *CustomAuthenticator) authMultiUser(clientIP, username, password, client
 		log.Printf("⚠️ [安全] 用户已禁用: %s", username)
 		return false, ""
 	}
-	if user.Password != password {
+	if !constTimeEqual(user.Password, password) {
 		a.recordFailure(clientIP)
 		return false, ""
 	}
@@ -500,33 +761,24 @@ func (a *CustomAuthenticator) authMultiUser(clientIP, username, password, client
 
 	a.recordSuccess(clientIP)
 
-	vip := a.ipAllocator.AllocateByDeviceID(username)
-	if vip == "" {
-		log.Printf("⚠️ [安全] 用户 %s 认证通过但无可用 IP", username)
-		return false, ""
-	}
-	log.Printf("✅ [认证] 多用户模式: %s → VIP %s (版本=%s, 来自 %s)",
-		username, vip, versionForLog(clientVersion), clientIP)
-	return true, vip
+	// ⭐ 安全审计 S1：登记数据面会话。
+	//    VIP 不再在这里分配 —— hy-core 的 Authenticate 返回值只作为
+	//    authID 用于日志，**不会发给客户端**，所以原来那次
+	//    AllocateByDeviceID(username) 纯属浪费地址（客户端实际用的是
+	//    DHCP 分配的地址）。现在 VIP 完全由 DHCP 分配，
+	//    数据面注册时再用 AuthorizeDataPlane 校验并绑定。
+	a.registerSession(clientIP, username)
+
+	log.Printf("✅ [认证] 用户 %s 通过 (版本=%s, 来自 %s)，等待数据面注册",
+		username, versionForLog(clientVersion), clientIP)
+
+	// 返回值即 hy-core 的 authID，只用于事件/流量日志 —— 用用户名最自然
+	return true, username
 }
 
-func (a *CustomAuthenticator) authSingleUser(clientIP, password, clientVersion string) (bool, string) {
-	globalPwd := a.userStore.GetGlobalPassword()
-	if password != globalPwd {
-		a.recordFailure(clientIP)
-		return false, ""
-	}
-
-	a.recordSuccess(clientIP)
-
-	vip := a.ipAllocator.Allocate(clientIP)
-	if vip == "" {
-		log.Printf("⚠️ [安全] IP %s 认证通过但无可用 IP", clientIP)
-		return false, ""
-	}
-	log.Printf("✅ [认证] 单用户模式: %s → VIP %s (版本=%s)",
-		clientIP, vip, versionForLog(clientVersion))
-	return true, vip
+// constTimeEqual 常量时间比较，避免按字节比较带来的计时侧信道。
+func constTimeEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func versionForLog(v string) string {

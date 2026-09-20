@@ -1,6 +1,7 @@
 export namespace config {
 	
 	export class ClientConfig {
+	    name: string;
 	    ip: string;
 	    port: number;
 	    portVPN: number;
@@ -19,6 +20,7 @@ export namespace config {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
 	        this.ip = source["ip"];
 	        this.port = source["port"];
 	        this.portVPN = source["portVPN"];

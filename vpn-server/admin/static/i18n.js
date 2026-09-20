@@ -148,10 +148,6 @@ window.HY2LINK_MESSAGES = {
         },
         settings: {
             title: '全局设置', desc: '密码、访问控制与性能调优',
-            globalPwd: '全局密码',
-            globalPwdLabel: '全局密码（单用户模式）',
-            globalPwdPlaceholder: 'test123',
-            globalPwdHint: '客户端不填用户名时使用此密码。填了「用户名:密码」则走多用户模式。',
             save: '保存', saved: '已保存', saveFail: '保存失败',
             adminPwd: '管理员密码',
             oldPwd: '原密码', oldPwdPlaceholder: '原密码',
@@ -326,10 +322,6 @@ window.HY2LINK_MESSAGES = {
         },
         settings: {
             title: '全域設定', desc: '密碼、存取控制與效能調校',
-            globalPwd: '全域密碼',
-            globalPwdLabel: '全域密碼（單使用者模式）',
-            globalPwdPlaceholder: 'test123',
-            globalPwdHint: '客戶端不填使用者名稱時使用此密碼。填了「使用者名稱:密碼」則走多使用者模式。',
             save: '儲存', saved: '已儲存', saveFail: '儲存失敗',
             adminPwd: '管理員密碼',
             oldPwd: '原密碼', oldPwdPlaceholder: '原密碼',
@@ -504,10 +496,6 @@ window.HY2LINK_MESSAGES = {
         },
         settings: {
             title: 'Settings', desc: 'Passwords, access control and performance',
-            globalPwd: 'Global password',
-            globalPwdLabel: 'Global password (single-user mode)',
-            globalPwdPlaceholder: 'test123',
-            globalPwdHint: 'Used when clients omit a username. With "username:password", multi-user mode is used.',
             save: 'Save', saved: 'Saved', saveFail: 'Save failed',
             adminPwd: 'Admin password',
             oldPwd: 'Current password', oldPwdPlaceholder: 'Current password',
@@ -682,10 +670,6 @@ window.HY2LINK_MESSAGES = {
         },
         settings: {
             title: '全体設定', desc: 'パスワード、アクセス制御、パフォーマンス',
-            globalPwd: 'グローバルパスワード',
-            globalPwdLabel: 'グローバルパスワード（シングルユーザーモード）',
-            globalPwdPlaceholder: 'test123',
-            globalPwdHint: 'クライアントがユーザー名を省略した場合に使用します。「ユーザー名:パスワード」形式ならマルチユーザーモードになります。',
             save: '保存', saved: '保存しました', saveFail: '保存に失敗',
             adminPwd: '管理者パスワード',
             oldPwd: '現在のパスワード', oldPwdPlaceholder: '現在のパスワード',

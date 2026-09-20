@@ -381,16 +381,29 @@ func (m *Manager) Start() error {
 	if cfg.UDPUnreliableEnabled {
 		udpUnreliablePorts = expandUDPSplitPorts(cfg.UDPUnreliablePorts)
 	}
-	log.Printf("🎮 [配置] UDP 可靠端口(匹配): %d 个，UDP 不可靠端口(对战): %d 个",
-		len(udpReliablePorts), len(udpUnreliablePorts))
+
+	// ⭐ 修复：原来无条件把 cfg.TCPSplitPorts 当作「游戏 TCP 端口」传给数据面，
+	//    导致 TCPSplitEnabled=false 时服务端**仍然**会把这些端口的 TCP
+	//    路由到 gameTCP 面（只有客户端侧按开关禁用了，两侧行为不一致）。
+	//    现在开关真正生效：关闭时端口表为空，gameTCP 面不会被使用。
+	var gamePorts []int
+	if cfg.TCPSplitEnabled {
+		gamePorts = cfg.TCPSplitPorts
+	}
+
+	log.Printf("🎮 [配置] TCP 拆分: %v (%d 个端口)，UDP 匹配: %v (%d 个端口)，UDP 对战: %v (%d 个端口)",
+		cfg.TCPSplitEnabled, len(gamePorts),
+		cfg.UDPReliableEnabled, len(udpReliablePorts),
+		cfg.UDPUnreliableEnabled, len(udpUnreliablePorts))
 
 	dataServer := quic.NewDataChannelServer(
 		ipAllocator,
 		m.adminState,
 		m.userStore,
+		auth, // ⭐ 安全审计 S1：数据面注册要用认证器记录的身份来校验
 		serverTun,
 		serverVIP,
-		cfg.TCPSplitPorts,
+		gamePorts,
 		udpReliablePorts,
 		udpUnreliablePorts,
 	)
@@ -399,8 +412,6 @@ func (m *Manager) Start() error {
 		go dataServer.ServerTunReadLoop()
 		go dataServer.TunWriteLoop()
 	}
-
-	log.Printf("🔀 TCP 连接拆分: %v", cfg.TCPSplitEnabled)
 
 	go func() {
 		obfsTag := "无混淆"
@@ -517,6 +528,17 @@ func (m *Manager) Kick(username string) error {
 		return fmt.Errorf("服务端未运行")
 	}
 	return ds.Kick(username)
+}
+
+// KickVIP 只踢掉指定 VIP 的那一个连接（共用账号时按连接精确踢出）
+func (m *Manager) KickVIP(vip string) error {
+	m.mu.RLock()
+	ds := m.dataServer
+	m.mu.RUnlock()
+	if ds == nil {
+		return fmt.Errorf("服务端未运行")
+	}
+	return ds.KickVIP(vip)
 }
 
 func (m *Manager) setError(err error) {

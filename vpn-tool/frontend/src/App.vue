@@ -197,6 +197,16 @@
             </div>
             <div class="card-body">
               <div class="form-grid">
+                <!-- ⭐ 连接名称：用户自定义（原来固定显示「连接一/连接二」） -->
+                <div class="field col-full">
+                  <label>{{ t('configName') }}</label>
+                  <input
+                      v-model="activeConnection.name"
+                      :placeholder="t('configNamePlaceholder')"
+                      maxlength="32"
+                      :disabled="isLocked"
+                  />
+                </div>
                 <div class="field col-addr">
                   <label>{{ t('configServer') }}</label>
                   <input
@@ -215,6 +225,16 @@
                       :disabled="isLocked"
                   />
                 </div>
+                <!-- ⭐ 用户名：对应服务端面板「用户管理」里的账户 -->
+                <div class="field col-user">
+                  <label>{{ t('configUsername') }}</label>
+                  <input
+                      v-model="activeConnection.username"
+                      :placeholder="t('configUsernamePlaceholder')"
+                      autocomplete="off"
+                      :disabled="isLocked"
+                  />
+                </div>
                 <div class="field col-pwd">
                   <label>{{ t('configPassword') }}</label>
                   <input
@@ -226,6 +246,7 @@
                   />
                 </div>
               </div>
+              <p class="field-hint">{{ t('configUserHint') }}</p>
 
               <details class="adv">
                 <summary>
@@ -687,10 +708,11 @@ export default {
       }
       try {
         const path = await window.go.main.App.ExportConfig({
+          name: conn.name || '',
           ip: conn.serverIP,
           port: conn.port,
           portVPN: 8444,
-          username: '',
+          username: conn.username || '',
           password: conn.password,
           useDHCP: true,
           staticIP: '',
@@ -727,6 +749,8 @@ export default {
             this.t('confirmExistsMsg', { name: exists.name || this.t('sidebarUntitled') }),
             () => {
               exists.password = cfg.password || ''
+              // ⭐ .hy2 里的用户名也要一起更新（服务端已停用全局密码）
+              if ((cfg.username || '').trim()) exists.username = cfg.username.trim()
               exists.obfsEnabled = !!cfg.obfsEnabled
               exists.obfsPassword = cfg.obfsPassword || ''
               exists.skipCertVerify = !!cfg.skipCertVerify
@@ -740,9 +764,11 @@ export default {
 
       const newConn = {
         id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
-        name: ip,
+        // ⭐ 优先用 .hy2 里的 name，其次用服务器地址
+        name: (cfg.name || '').trim() || ip,
         serverIP: ip,
         port: port,
+        username: (cfg.username || '').trim(),
         password: cfg.password || '',
         status: 'disconnected',
         skipCertVerify: !!cfg.skipCertVerify,
@@ -848,6 +874,7 @@ export default {
         name: '',
         serverIP: '',
         port: 8443,
+        username: '',
         password: '',
         status: 'disconnected',
         skipCertVerify: false,
@@ -927,6 +954,8 @@ export default {
       const conn = this.activeConnection
       if (!conn) return
       if (!conn.serverIP) { this.showToastMessage(this.t('toastNeedServer'), 'error'); return }
+      // ⭐ 服务端已停用全局密码：用户名必填，且必须是服务端「用户管理」里的账户
+      if (!(conn.username || '').trim()) { this.showToastMessage(this.t('toastNeedUsername'), 'error'); return }
       if (!conn.password) { this.showToastMessage(this.t('toastNeedPassword'), 'error'); return }
       if (conn.obfsEnabled) {
         const psk = (conn.obfsPassword || '').trim()
@@ -949,7 +978,7 @@ export default {
         const ip = await window.go.main.App.ConnectClient({
           ip: conn.serverIP,
           port: conn.port,
-          username: '',
+          username: (conn.username || '').trim(),
           password: conn.password,
           useDHCP: true,
           staticIP: '',
@@ -1067,6 +1096,9 @@ export default {
             if (typeof c.skipCertVerify !== 'boolean') c.skipCertVerify = false
             if (typeof c.obfsEnabled !== 'boolean') c.obfsEnabled = false
             if (typeof c.obfsPassword !== 'string') c.obfsPassword = ''
+            // ⭐ 老版本存下的连接没有「用户名 / 连接名称」字段，补默认值
+            if (typeof c.username !== 'string') c.username = ''
+            if (typeof c.name !== 'string') c.name = ''
           })
         }
       } catch (e) { console.warn('load connections failed:', e) }
@@ -1770,9 +1802,11 @@ textarea {
 /* Form */
 .form-grid {
   display: grid;
-  grid-template-columns: 2fr 90px 2fr;
+  /* ⭐ 连接名称占满一行；其余为 地址 / 端口 / 用户名 / 密码 */
+  grid-template-columns: 2fr 90px 2fr 2fr;
   gap: 12px;
 }
+.col-full { grid-column: 1 / -1; }
 .field {
   display: flex;
   flex-direction: column;
@@ -1906,6 +1940,13 @@ textarea {
   border-radius: var(--r-sm);
   line-height: 1.4;
   margin-top: 4px;
+}
+/* ⭐ 表单下方的说明文字（如「用户名见服务端用户管理」） */
+.field-hint {
+  margin: 10px 2px 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim, #8a8f98);
 }
 .hint-row.ok {
   background: rgba(34, 197, 94, 0.06);
@@ -2218,6 +2259,7 @@ textarea {
     max-height: 200px;
   }
   .form-grid { grid-template-columns: 1fr 80px 1fr; }
+  .col-full { grid-column: 1 / -1; }
   .hero-stats { grid-template-columns: repeat(2, 1fr); }
   .hero-cell:nth-child(2) { border-right: none; }
 }

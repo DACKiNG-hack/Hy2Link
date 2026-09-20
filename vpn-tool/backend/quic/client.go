@@ -3,7 +3,6 @@ package quic
 // backend/quic/client.go
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -33,7 +32,7 @@ import (
 )
 
 const maxFrameSize = 65535
-const tunMTU = 1380
+const tunMTU = 1400
 
 // ⭐ ALPN 改名（hysteria 认证的 "h3" 由 hysteria core 内部处理）
 const (
@@ -41,7 +40,7 @@ const (
 	alpnCtrl = "h3-ctrl"
 )
 
-const ClientVersion = "1.0.0"
+const ClientVersion = "1.1.0"
 const hardcodedBBRProfile = "ultra"
 const hardcodedLatencyMode = "low"
 
@@ -224,6 +223,25 @@ func isQUICDCDebug() bool {
 
 // ========== 指纹存储 ==========
 
+// fingerprintPath 返回某个服务器的指纹文件路径。
+//
+// ⭐ 安全审计 S33（High）：原实现是
+//
+//	safe := strings.ReplaceAll(serverIP, ":", "_")
+//	safe = strings.ReplaceAll(safe, "/", "_")   // 反斜杠与 ".." 都没有过滤
+//	return filepath.Join(dir, "fp_"+safe+".txt")
+//
+// 而 filepath.Join 会做**纯词法**的 ".." 归约，前缀 "fp_" 会被紧跟的
+// 第一个 ".." 抵消掉，实测（Go 1.26 / Windows）：
+//
+//	"..\..\..\..\..\..\..\Users\Public\secret"  ->  C:\Users\Public\secret.txt
+//
+// serverIP 直接来自 .hy2 文件里的 server 字段（原来完全不校验），
+// 因此导入一个恶意 .hy2 就能对任意 *.txt 做
+// 「存在性探测（HasPinnedFingerprint）」「删除（清除指纹）」
+// 「内容读取（GetPinnedFingerprint，已绑定到 webview JS）」。
+//
+// 现在改为对 serverIP 取 SHA-256 当文件名，与路径语义彻底解耦。
 func fingerprintPath(serverIP string) string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
@@ -231,9 +249,9 @@ func fingerprintPath(serverIP string) string {
 	}
 	dir = filepath.Join(dir, "hy2link")
 	_ = os.MkdirAll(dir, 0700)
-	safe := strings.ReplaceAll(serverIP, ":", "_")
-	safe = strings.ReplaceAll(safe, "/", "_")
-	return filepath.Join(dir, "fp_"+safe+".txt")
+
+	sum := sha256.Sum256([]byte(serverIP))
+	return filepath.Join(dir, "fp_"+hex.EncodeToString(sum[:])+".txt")
 }
 
 func loadPinnedFingerprint(serverIP string) string {
@@ -241,19 +259,44 @@ func loadPinnedFingerprint(serverIP string) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	fp := strings.ToLower(strings.TrimSpace(string(data)))
+	// ⭐ 安全审计 S38：只接受合法的 SHA-256 十六进制串。
+	//    指纹文件是非原子写入且错误被忽略过，截断/半写的文件会让
+	//    后续的 known[:16] 切片越界 panic —— 而那里没有任何 recover。
+	//    这里直接把不合格的内容当作「没有指纹」，同时下方也不再切片。
+	if len(fp) != 64 {
+		return ""
+	}
+	if _, err := hex.DecodeString(fp); err != nil {
+		return ""
+	}
+	return fp
 }
 
+// savePinnedFingerprint 原子写入指纹文件。
+// ⭐ 安全审计 S36/S38：原实现直接用 os.WriteFile，非原子且错误被忽略。
 func savePinnedFingerprint(serverIP, fp string) error {
-	return os.WriteFile(fingerprintPath(serverIP), []byte(fp), 0600)
+	path := fingerprintPath(serverIP)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(fp), 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func clearPinnedFingerprint(serverIP string) error {
-	err := os.Remove(fingerprintPath(serverIP))
-	if os.IsNotExist(err) {
-		return nil
+	path := fingerprintPath(serverIP)
+	err := os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	return err
+	// 顺带清理可能残留的临时文件
+	_ = os.Remove(path + ".tmp")
+	return nil
 }
 
 func dumpTCPPacket(pkt []byte, direction string) {
@@ -622,6 +665,14 @@ func (c *Hysteria2Client) isUDPUnreliablePort(port uint16) bool {
 
 // ========== 证书验证 ==========
 
+// verifyPin 通过 TOFU 指纹固定校验服务端证书。
+//
+// ⭐ 安全审计 S3 / S36 / S38：
+//   - 「解析失败就放行」改为返回错误；
+//   - 指纹保存失败必须视为**致命**错误（原实现只打一行日志，
+//     写不进去时每次连接都会退化成「首次连接」→ 指纹保护永久失效，失败开放）；
+//   - 打印与比较完整指纹，不再做 `known[:16]` / `got[:16]` 切片
+//     （指纹文件被截断时那会 panic，而 TLS 回调里没有 recover）。
 func (c *Hysteria2Client) verifyPin() func([][]byte, [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		if c.skipCertVerify {
@@ -632,7 +683,7 @@ func (c *Hysteria2Client) verifyPin() func([][]byte, [][]*x509.Certificate) erro
 		}
 		cert, err := x509.ParseCertificate(rawCerts[0])
 		if err != nil {
-			return fmt.Errorf("解析证书失败: %w", err)
+			return fmt.Errorf("解析服务端证书失败: %w", err)
 		}
 		now := time.Now()
 		if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
@@ -644,39 +695,55 @@ func (c *Hysteria2Client) verifyPin() func([][]byte, [][]*x509.Certificate) erro
 
 		known := loadPinnedFingerprint(c.serverIP)
 		if known == "" {
+			// 首次连接：TOFU 固定。
+			// TODO(S36 剩余部分)：目前是「静默固定 + 醒目日志」，
+			//  理想的 TOFU 应当弹出指纹让用户确认后再固定；
+			//  这需要 UI 侧配合（弹出 + 阻塞等待用户选择），留待下一步。
 			if err := savePinnedFingerprint(c.serverIP, got); err != nil {
-				log.Printf("⚠️ [客户端] 保存指纹失败: %v", err)
+				return fmt.Errorf("保存服务端指纹失败，拒绝以不安全状态继续连接: %w", err)
 			}
-			log.Printf("📌 [客户端] 首次连接，已记录服务端指纹: %s", got[:16])
+			log.Printf("📌 [客户端] 首次连接 %s，已记录服务端证书指纹:", c.serverIP)
+			log.Printf("           SHA-256 = %s", got)
+			log.Printf("           如与管理员公布的不一致，请立即断开并清除该指纹。")
 			return nil
 		}
-		if known != got {
+		if !strings.EqualFold(known, got) {
 			return fmt.Errorf("⚠️ 服务端证书指纹不匹配\n"+
 				"  已知: %s\n"+
 				"  收到: %s\n"+
 				"可能被中间人攻击，或服务端重新生成过证书。\n"+
 				"如确认安全，请在客户端清除已保存的指纹后重试。",
-				known[:16], got[:16])
+				known, got)
 		}
 		return nil
 	}
 }
 
+// verifyPinOrCA 用于**认证（引导）连接**的证书校验。
+//
+// ⭐ 安全审计 S3（Critical）：原实现是
+//
+//	cert, err := x509.ParseCertificate(rawCerts[0])
+//	if err != nil { return nil }                                    // 解析失败 → 放行
+//	if !bytes.Equal(cert.RawIssuer, cert.RawSubject) { return nil }  // 非自签 → 放行
+//	return c.verifyPin()(rawCerts, nil)
+//
+// 配合调用处的 `InsecureSkipVerify: true`，它等于「**任何非自签证书都无条件接受**」：
+// 既不验证签发链，也不验证域名与有效期。攻击者只要持有一张任意 CA 签发的证书
+// （例如自己域名的 Let's Encrypt 证书）就能中间人这条连接，
+// 而 hysteria 的认证串 `user:pass:vn=x.y.z` 是明文送进去的 → 口令泄露。
+//
+// 引导连接的固有难点是：此刻还不知道服务端的 ACME 域名
+// （serverHostname 要等 DHCP 应答才拿到），无法做主机名校验。
+// 因此正确做法是：**引导连接一律使用 TOFU 指纹固定**（自签与 ACME 一视同仁）；
+// 后续的数据面连接再按 DHCP 下发的 certMode/hostname 走严格 CA 校验
+// —— `buildTLSConfig` 已经是这么做的，那里不需要改动。
 func (c *Hysteria2Client) verifyPinOrCA() func([][]byte, [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		if c.skipCertVerify {
 			return nil
 		}
-		if len(rawCerts) == 0 {
-			return fmt.Errorf("服务端未提供证书")
-		}
-		cert, err := x509.ParseCertificate(rawCerts[0])
-		if err != nil {
-			return nil
-		}
-		if !bytes.Equal(cert.RawIssuer, cert.RawSubject) {
-			return nil
-		}
+		// 统一走指纹固定：绝不因为「证书不是自签」就放行。
 		return c.verifyPin()(rawCerts, nil)
 	}
 }
@@ -730,9 +797,57 @@ func GetPinnedFingerprintByIP(serverIP string) string {
 	return loadPinnedFingerprint(serverIP)
 }
 
+// validateTunnelIPv4 校验服务端（或本地配置）下发的虚拟 IP 与掩码。
+//
+// ⭐ 安全审计 S34：这两个值会被直接用于
+//  1. 配置本机 TUN 适配器地址；
+//  2. 通过 `route add <net> mask <mask> <vip> if <idx>` 添加路由。
+//
+// 而 net.ParseIP 过于宽松：它接受 0.0.0.0、IPv6 字面量，
+// 以及 255.0.255.0 这类非连续掩码。其中 mask=0.0.0.0 会让
+// calculateNetwork 得到 0.0.0.0、maskToPrefix 得到 "0"，
+// 于是客户端**自己**装上一整条默认路由指向隧道 —— 整机流量改道。
+func validateTunnelIPv4(ip, mask string) error {
+	ipAddr := net.ParseIP(ip)
+	if ipAddr == nil || ipAddr.To4() == nil {
+		return fmt.Errorf("无效的 IPv4 地址: %q", ip)
+	}
+	ip4 := ipAddr.To4()
+	// 未指定 / 组播 / 广播地址都不该被当成隧道本机地址：
+	// 0.0.0.0 会让 `netsh ... static 0.0.0.0 <mask>` 与本机网络配置打架。
+	if ip4.IsUnspecified() {
+		return fmt.Errorf("服务端下发了未指定地址: %s", ip)
+	}
+	if ip4.IsMulticast() {
+		return fmt.Errorf("服务端下发了组播地址: %s", ip)
+	}
+	if ip4.Equal(net.IPv4bcast) {
+		return fmt.Errorf("服务端下发了广播地址: %s", ip)
+	}
+
+	maskAddr := net.ParseIP(mask)
+	if maskAddr == nil || maskAddr.To4() == nil {
+		return fmt.Errorf("无效的 IPv4 掩码: %q", mask)
+	}
+	ones, bits := net.IPMask(maskAddr.To4()).Size()
+	// Size() 对非连续掩码返回 (0, 0)
+	if bits != 32 || ones < 8 || ones > 30 {
+		return fmt.Errorf("不合理的掩码: %s（/%d，仅接受 /8–/30 的连续掩码）", mask, ones)
+	}
+	return nil
+}
+
 // ========== Connect ==========
 
-func (c *Hysteria2Client) Connect() (string, error) {
+// ⭐ 使用命名返回值 + defer 兜底，任何中途失败都会自动清理残留资源
+func (c *Hysteria2Client) Connect() (retIP string, retErr error) {
+	success := false
+	defer func() {
+		if !success {
+			c.cleanupPartial()
+		}
+	}()
+
 	ipAddr, err := net.ResolveIPAddr("ip4", c.serverIP)
 	if err != nil {
 		return "", fmt.Errorf("解析服务器地址失败（仅支持 IPv4）: %v", err)
@@ -771,10 +886,13 @@ func (c *Hysteria2Client) Connect() (string, error) {
 		KeepAlivePeriod:                preset.keepAlive,
 	}
 
-	authStr := c.password
-	if c.username != "" {
-		authStr = c.username + ":" + c.password
+	// ⭐ 服务端已停用全局密码（单用户模式）：必须使用「用户名:密码」认证。
+	//    用户名还必须是服务端「用户管理」里存在的账户。
+	if strings.TrimSpace(c.username) == "" {
+		return "", fmt.Errorf("请填写用户名：服务端已停用全局密码，" +
+			"客户端必须以「用户名 + 密码」认证（用户名见服务端的用户管理）")
 	}
+	authStr := c.username + ":" + c.password
 	authStr = authStr + ":vn=" + ClientVersion
 
 	hyCfg := &client.Config{
@@ -836,8 +954,14 @@ func (c *Hysteria2Client) Connect() (string, error) {
 		}
 		ip = strings.TrimSpace(parts[0])
 		mask = strings.TrimSpace(parts[1])
-		if net.ParseIP(ip) == nil || net.ParseIP(mask) == nil {
-			return "", fmt.Errorf("收到无效 IP 或掩码")
+
+		// ⭐ 安全审计 S34：原来只用 net.ParseIP 校验，它会放过
+		// 0.0.0.0、IPv6 字面量，以及 255.0.255.0 这类非连续掩码。
+		// 其中 mask=0.0.0.0 会让本机装上一条 0.0.0.0/0 默认路由指向隧道，
+		// 整机流量改道（而服务端是能被中间人控制的输入端）。
+		// 这里要求：合法 IPv4 + 掩码必须是合理范围内的连续前缀。
+		if err := validateTunnelIPv4(ip, mask); err != nil {
+			return "", err
 		}
 
 		c.serverSplitEnabled = false
@@ -909,8 +1033,9 @@ func (c *Hysteria2Client) Connect() (string, error) {
 	} else {
 		ip = c.staticIP
 		mask = c.staticMask
-		if net.ParseIP(ip) == nil || net.ParseIP(mask) == nil {
-			return "", fmt.Errorf("静态 IP 或掩码无效")
+		// ⭐ 安全审计 S34：静态 IP 同样必须严格校验
+		if err := validateTunnelIPv4(ip, mask); err != nil {
+			return "", err
 		}
 		c.serverSplitEnabled = false
 		c.serverSplitPorts = make(map[uint16]bool)
@@ -1040,7 +1165,72 @@ func (c *Hysteria2Client) Connect() (string, error) {
 
 	go c.heartbeatLoop(hbStream, preset.heartbeat)
 
+	// ⭐ 标记成功，禁用 defer 中的清理
+	success = true
 	return ip, nil
+}
+
+// ⭐ cleanupPartial 清理 Connect 中途失败时残留的资源
+// 幂等：可以安全地重复调用
+func (c *Hysteria2Client) cleanupPartial() {
+	log.Printf("🧹 [客户端] 连接未完成，清理残留资源...")
+
+	// 数据面连接
+	if c.dataConn != nil {
+		_ = c.dataConn.CloseWithError(0, "")
+		c.dataConn = nil
+	}
+	if c.matchConn != nil {
+		_ = c.matchConn.CloseWithError(0, "")
+		c.matchConn = nil
+	}
+	if c.gameTCPConn != nil {
+		_ = c.gameTCPConn.CloseWithError(0, "")
+		c.gameTCPConn = nil
+	}
+	if c.gameConn != nil {
+		_ = c.gameConn.CloseWithError(0, "")
+		c.gameConn = nil
+	}
+	if c.ctrlConn != nil {
+		_ = c.ctrlConn.CloseWithError(0, "")
+		c.ctrlConn = nil
+	}
+
+	// 共享 Transport / UDP socket
+	if c.sharedTransport != nil {
+		_ = c.sharedTransport.Close()
+		c.sharedTransport = nil
+	}
+	if c.sharedUDPConn != nil {
+		_ = c.sharedUDPConn.Close()
+		c.sharedUDPConn = nil
+	}
+
+	// TUN
+	if c.tunDevice != nil {
+		_ = c.tunDevice.Close()
+		c.tunDevice = nil
+		log.Printf("🧹 [客户端] 已释放 TUN 设备")
+	}
+
+	// hysteria 控制面
+	if c.hysteriaClient != nil {
+		_ = c.hysteriaClient.Close()
+		c.hysteriaClient = nil
+	}
+
+	// 取消所有 context（幂等，可重复调用）
+	c.cancel()
+	c.dataCancel()
+	c.matchCancel()
+	c.gameTCPCancel()
+	c.gameCancel()
+	c.ctrlCancel()
+
+	c.mu.Lock()
+	c.connected = false
+	c.mu.Unlock()
 }
 
 // ⭐ 统一 QUIC 拨号：有 sharedTransport 就复用它（已混淆），否则回退 quic.DialAddr

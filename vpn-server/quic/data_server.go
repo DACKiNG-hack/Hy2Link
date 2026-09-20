@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,6 +76,19 @@ type clientStream struct {
 
 	username string
 	mode     string
+	// peerIP 认证与数据面所在的 QUIC 对端 IP（不可伪造），用于断开时释放会话
+	peerIP string
+
+	// ⭐ 安全审计 S10：auxMu 保护下面全部「附属面」的指针字段。
+	//
+	// 这些字段原来被多个 goroutine 无锁读写：
+	//   - handle*Conn 在建立/断开时写；
+	//   - readTCPStream / readUDPStream / readMatchStream / ... 在转发时读。
+	// 原来的 atomic.Bool 只保护了「就绪标志」，紧邻的指针不受保护，
+	// 于是存在 TOCTOU：Load() 读到 true 之后 gameConn 可能已被置 nil，
+	// 紧接着 SendDatagram 解引用 nil → panic → 整个服务端进程崩溃（远端可触发）。
+	// 现在「标志 + 指针」都在同一把锁下读写，彻底消除该窗口。
+	auxMu sync.RWMutex
 
 	// dataConn：bulk TCP + 非匹配/非对战 UDP
 	dataConn   *quic.Conn
@@ -108,51 +122,228 @@ type clientStream struct {
 	lastSeen   time.Time
 }
 
+// ---------- 附属面指针的安全读写（安全审计 S10） ----------
+//
+// 约定：所有对上面那些指针字段的访问都必须经过这些方法，
+// 不要再直接读写字段本身。
+
+func (cs *clientStream) getDataConn() *quic.Conn {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.dataConn
+}
+
+func (cs *clientStream) getTCPStream() *quic.Stream {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.tcpStream
+}
+
+func (cs *clientStream) getUDPStream() *quic.Stream {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.udpStream
+}
+
+func (cs *clientStream) getMatchStream() *quic.Stream {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.matchStream
+}
+
+func (cs *clientStream) getMatchConn() *quic.Conn {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.matchConn
+}
+
+func (cs *clientStream) getGameTCPConn() *quic.Conn {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.gameTCPConn
+}
+
+func (cs *clientStream) getGameConn() *quic.Conn {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.gameConn
+}
+
+func (cs *clientStream) getCtrlConn() *quic.Conn {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.ctrlConn
+}
+
+func (cs *clientStream) getICMPStream() *quic.Stream {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.icmpStream
+}
+
+func (cs *clientStream) getHBStream() *quic.Stream {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.hbStream
+}
+
+// setBulkStreams 登记 bulk 面（dataConn + TCP/UDP 流）
+func (cs *clientStream) setBulkStreams(conn *quic.Conn, tcp, udp *quic.Stream) {
+	cs.auxMu.Lock()
+	cs.dataConn = conn
+	cs.tcpStream = tcp
+	cs.udpStream = udp
+	cs.auxMu.Unlock()
+}
+
+// setMatch 登记匹配面。先置指针，再算「就绪」。
+func (cs *clientStream) setMatch(conn *quic.Conn, stream *quic.Stream) {
+	cs.auxMu.Lock()
+	cs.matchConn = conn
+	cs.matchStream = stream
+	cs.auxMu.Unlock()
+}
+
+// clearMatch 注销匹配面
+func (cs *clientStream) clearMatch() {
+	cs.auxMu.Lock()
+	cs.matchConn = nil
+	cs.matchStream = nil
+	cs.auxMu.Unlock()
+}
+
+// setGameTCP 登记游戏 TCP 面
+func (cs *clientStream) setGameTCP(conn *quic.Conn, stream *quic.Stream) {
+	cs.auxMu.Lock()
+	cs.gameTCPConn = conn
+	cs.gameTCPStream = stream
+	cs.auxMu.Unlock()
+}
+
+func (cs *clientStream) clearGameTCP() {
+	cs.auxMu.Lock()
+	cs.gameTCPConn = nil
+	cs.gameTCPStream = nil
+	cs.auxMu.Unlock()
+}
+
+// setGame 登记对战 UDP datagram 面。
+// ⭐ 顺序很重要：先设指针，再置就绪标志。
+func (cs *clientStream) setGame(conn *quic.Conn) {
+	cs.auxMu.Lock()
+	cs.gameConn = conn
+	cs.gameDatagramReady.Store(true)
+	cs.auxMu.Unlock()
+}
+
+// clearGame 注销对战 UDP 面。
+// ⭐ 顺序与 setGame 相反：先清就绪标志，再置空指针，
+// 与读者在同一把锁下互斥，读者不可能观察到「标志为真但指针为 nil」。
+func (cs *clientStream) clearGame() {
+	cs.auxMu.Lock()
+	cs.gameDatagramReady.Store(false)
+	cs.gameConn = nil
+	cs.auxMu.Unlock()
+}
+
+// setCtrl 登记控制面
+func (cs *clientStream) setCtrl(conn *quic.Conn, icmp, hb *quic.Stream) {
+	cs.auxMu.Lock()
+	cs.ctrlConn = conn
+	cs.icmpStream = icmp
+	cs.hbStream = hb
+	cs.ctrlReady.Store(true)
+	cs.auxMu.Unlock()
+}
+
+// clearCtrl 注销控制面。
+// ⭐ 先清标志，再置空指针（避免「标志为真但流为 nil」）。
+func (cs *clientStream) clearCtrl() {
+	cs.auxMu.Lock()
+	cs.ctrlReady.Store(false)
+	cs.icmpStream = nil
+	cs.hbStream = nil
+	cs.ctrlConn = nil
+	cs.auxMu.Unlock()
+}
+
+// closeAll 关闭该客户端持有的全部 QUIC 连接（幂等）。
+// 先把指针快照出来再关闭，避免持锁调用可能阻塞/回调的 Close。
+func (cs *clientStream) closeAll(reason string) {
+	cs.auxMu.RLock()
+	conns := []*quic.Conn{cs.dataConn, cs.matchConn, cs.gameTCPConn, cs.gameConn, cs.ctrlConn}
+	cs.auxMu.RUnlock()
+
+	for _, c := range conns {
+		if c != nil {
+			_ = c.CloseWithError(0, reason)
+		}
+	}
+}
+
 func (cs *clientStream) writeTCPFrame(data []byte) error {
 	cs.tcpWriteMu.Lock()
 	defer cs.tcpWriteMu.Unlock()
-	return writeFrameToStream(cs.tcpStream, data)
+	stream := cs.getTCPStream()
+	if stream == nil {
+		return fmt.Errorf("TCP 流未就绪")
+	}
+	return writeFrameToStream(stream, data)
 }
 
 // ⭐ 匹配 UDP：走 matchConn stream
 func (cs *clientStream) writeMatchFrame(data []byte) error {
-	if cs.matchStream == nil {
+	cs.matchWriteMu.Lock()
+	stream := cs.getMatchStream()
+	if stream == nil {
+		cs.matchWriteMu.Unlock()
 		// 降级：对端没建立 matchConn，走 dataConn UDP stream
 		return cs.writeUDPFrame(data)
 	}
-	cs.matchWriteMu.Lock()
 	defer cs.matchWriteMu.Unlock()
-	return writeFrameToStream(cs.matchStream, data)
+	return writeFrameToStream(stream, data)
 }
 
 func (cs *clientStream) writeGameTCPFrame(data []byte) error {
-	if cs.gameTCPStream == nil {
+	cs.gameTCPWriteMu.Lock()
+	stream := cs.getGameTCPStreamLocked()
+	if stream == nil {
+		cs.gameTCPWriteMu.Unlock()
 		return cs.writeTCPFrame(data)
 	}
-	cs.gameTCPWriteMu.Lock()
 	defer cs.gameTCPWriteMu.Unlock()
-	return writeFrameToStream(cs.gameTCPStream, data)
+	return writeFrameToStream(stream, data)
+}
+
+// getGameTCPStreamLocked 语义与 getGameTCPStream 相同，
+// 单独命名以表明调用方已持有 gameTCPWriteMu。
+func (cs *clientStream) getGameTCPStreamLocked() *quic.Stream {
+	cs.auxMu.RLock()
+	defer cs.auxMu.RUnlock()
+	return cs.gameTCPStream
 }
 
 func (cs *clientStream) writeUDPFrame(data []byte) error {
 	cs.udpWriteMu.Lock()
 	defer cs.udpWriteMu.Unlock()
-	return writeFrameToStream(cs.udpStream, data)
+	stream := cs.getUDPStream()
+	if stream == nil {
+		return fmt.Errorf("UDP 流未就绪")
+	}
+	return writeFrameToStream(stream, data)
 }
 
 func (cs *clientStream) writeICMPFrame(data []byte) error {
-	if cs.icmpStream == nil {
-		return fmt.Errorf("ICMP 流未就绪")
-	}
 	cs.icmpWriteMu.Lock()
 	defer cs.icmpWriteMu.Unlock()
-	return writeFrameToStream(cs.icmpStream, data)
+	stream := cs.getICMPStream()
+	if stream == nil {
+		return fmt.Errorf("ICMP 流未就绪")
+	}
+	return writeFrameToStream(stream, data)
 }
 
 func (cs *clientStream) writeHeartbeatFrame(frameType byte, payload []byte) error {
-	if cs.hbStream == nil {
-		return fmt.Errorf("心跳流未就绪")
-	}
 	totalLen := 1 + len(payload)
 	if 4+totalLen > 4+maxFrameSize {
 		return fmt.Errorf("心跳帧过大")
@@ -160,6 +351,12 @@ func (cs *clientStream) writeHeartbeatFrame(frameType byte, payload []byte) erro
 
 	cs.hbWriteMu.Lock()
 	defer cs.hbWriteMu.Unlock()
+
+	// ⭐ 安全审计 S10：在写锁内取流，避免流指针被并发替换
+	stream := cs.getHBStream()
+	if stream == nil {
+		return fmt.Errorf("心跳流未就绪")
+	}
 
 	bufPtr := writeBufPool.Get().(*[]byte)
 	defer writeBufPool.Put(bufPtr)
@@ -171,7 +368,7 @@ func (cs *clientStream) writeHeartbeatFrame(frameType byte, payload []byte) erro
 		copy(buf[5:], payload)
 	}
 
-	_, err := cs.hbStream.Write(buf[:4+totalLen])
+	_, err := stream.Write(buf[:4+totalLen])
 	return err
 }
 
@@ -216,14 +413,24 @@ func readFrame(stream *quic.Stream, buf []byte) ([]byte, error) {
 	return buf[:length], nil
 }
 
+// maxRegFrameSize 注册帧的硬上限。
+// 正常注册帧只有几十字节；绝不能对远端可控的流做无界读取。
+const maxRegFrameSize = 512
+
 func readRegFrame(stream *quic.Stream) (string, error) {
 	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
-	data, err := io.ReadAll(stream)
+	// ⭐ 安全审计 S8：原来用 io.ReadAll 无上限读取，
+	//    攻击者可在 10 秒超时内持续灌数据，几十条连接即可打爆服务端内存。
+	//    这里用 LimitReader 多读 1 字节以便区分「刚好等于上限」与「超限」。
+	data, err := io.ReadAll(io.LimitReader(stream, maxRegFrameSize+1))
 	if err != nil {
 		return "", err
 	}
 	if len(data) == 0 {
 		return "", fmt.Errorf("空注册帧")
+	}
+	if len(data) > maxRegFrameSize {
+		return "", fmt.Errorf("注册帧过大: >%d 字节", maxRegFrameSize)
 	}
 	return strings.TrimSpace(string(data)), nil
 }
@@ -235,6 +442,9 @@ type DataChannelServer struct {
 	ipAllocator *IPAllocator
 	adminState  *admin.AdminState
 	userStore   *store.Store
+
+	// ⭐ 安全审计 S1：数据面注册必须用认证阶段记录的身份来校验
+	auth *CustomAuthenticator
 
 	serverTun *tun.TUNDevice
 	serverVIP [4]byte
@@ -331,6 +541,7 @@ func NewDataChannelServer(
 	ipAllocator *IPAllocator,
 	adminState *admin.AdminState,
 	userStore *store.Store,
+	auth *CustomAuthenticator,
 	serverTun *tun.TUNDevice,
 	serverVIP [4]byte,
 	gamePorts []int,
@@ -366,6 +577,7 @@ func NewDataChannelServer(
 		ipAllocator:        ipAllocator,
 		adminState:         adminState,
 		userStore:          userStore,
+		auth:               auth,
 		serverTun:          serverTun,
 		serverVIP:          serverVIP,
 		tunWriteChan:       make(chan []byte, 512),
@@ -389,21 +601,8 @@ func (s *DataChannelServer) register(vipBytes [4]byte, cs *clientStream) {
 
 	if old, ok := shard.conns[vipBytes]; ok {
 		log.Printf("⚠️ VIP %s 重复注册，踢掉旧连接", old.vip)
-		if old.dataConn != nil {
-			_ = old.dataConn.CloseWithError(0, "replaced by new connection")
-		}
-		if old.matchConn != nil {
-			_ = old.matchConn.CloseWithError(0, "replaced by new connection")
-		}
-		if old.gameTCPConn != nil {
-			_ = old.gameTCPConn.CloseWithError(0, "replaced by new connection")
-		}
-		if old.gameConn != nil {
-			_ = old.gameConn.CloseWithError(0, "replaced by new connection")
-		}
-		if old.ctrlConn != nil {
-			_ = old.ctrlConn.CloseWithError(0, "replaced by new connection")
-		}
+		// ⭐ 安全审计 S10：统一走 closeAll（内部持锁取快照再关闭）
+		old.closeAll("replaced by new connection")
 	}
 	shard.conns[vipBytes] = cs
 }
@@ -440,44 +639,89 @@ func (s *DataChannelServer) count() int {
 	return total
 }
 
+// Kick 踢出某个用户名的**全部**在线连接。
+//
+// ⭐ 一个账号允许被多个客户端共用（见 authenticator.go 的说明），
+// 因此不能只踢第一个匹配的连接 —— 那样共用账号时"踢人"会失效。
 func (s *DataChannelServer) Kick(username string) error {
+	n := s.kickAll(username)
+	if n == 0 {
+		return fmt.Errorf("用户 %s 不在线", username)
+	}
+	log.Printf("👢 踢出: %s（%d 个连接）", username, n)
+	return nil
+}
+
+// KickVIP 只踢掉占用指定 VIP 的那**一个**连接。
+//
+// ⭐ 一个账号允许被多个客户端共用，面板的在线列表是「一连接一行」，
+// 因此需要能按 VIP 精确踢出，而不是把该账号的所有连接一起踢掉。
+func (s *DataChannelServer) KickVIP(vip string) error {
+	ip := net.ParseIP(vip)
+	if ip == nil || ip.To4() == nil {
+		return fmt.Errorf("无效的 VIP: %s", vip)
+	}
+	var b [4]byte
+	copy(b[:], ip.To4())
+
+	shard := s.shards[getShardIndex(b)]
+	shard.mu.RLock()
+	cs := shard.conns[b]
+	shard.mu.RUnlock()
+
+	if cs == nil {
+		return fmt.Errorf("VIP %s 不在线", vip)
+	}
+	log.Printf("👢 踢出单个连接: %s (VIP %s)", cs.username, vip)
+	cs.closeAll("kicked by admin")
+	return nil
+}
+
+// kickAll 踢掉所有匹配用户名的连接，返回被踢的连接数（便于测试）。
+func (s *DataChannelServer) kickAll(username string) int {
+	count := 0
 	for i := 0; i < numShards; i++ {
 		shard := s.shards[i]
+
+		// 先在读锁下收集目标，解锁后再关闭连接 ——
+		// 避免持有分片锁时执行可能阻塞/回调的 CloseWithError。
 		shard.mu.RLock()
-		var target *clientStream
+		var targets []*clientStream
 		for _, cs := range shard.conns {
 			if cs.username == username {
-				target = cs
-				break
+				targets = append(targets, cs)
 			}
 		}
 		shard.mu.RUnlock()
 
-		if target != nil {
+		for _, target := range targets {
 			log.Printf("👢 踢出: %s (VIP %s)", username, target.vip)
-			if target.dataConn != nil {
-				_ = target.dataConn.CloseWithError(0, "kicked by admin")
-			}
-			if target.matchConn != nil {
-				_ = target.matchConn.CloseWithError(0, "kicked by admin")
-			}
-			if target.gameTCPConn != nil {
-				_ = target.gameTCPConn.CloseWithError(0, "kicked by admin")
-			}
-			if target.gameConn != nil {
-				_ = target.gameConn.CloseWithError(0, "kicked by admin")
-			}
-			if target.ctrlConn != nil {
-				_ = target.ctrlConn.CloseWithError(0, "kicked by admin")
-			}
-			return nil
+			// ⭐ 安全审计 S10：统一走 closeAll
+			target.closeAll("kicked by admin")
+			count++
 		}
 	}
-	return fmt.Errorf("用户 %s 不在线", username)
+	return count
 }
 
 func (s *DataChannelServer) HandleDataConn(conn *quic.Conn) {
-	go s.handleDataConn(conn)
+	s.goSafe("handleDataConn", func() { s.handleDataConn(conn) })
+}
+
+// goSafe 启动一个带 panic 兜底的 goroutine。
+//
+// ⭐ 安全审计 S10：转发路径上任何一次 nil 解引用/越界都会终结整个服务端进程
+// （main 里没有 recover，托盘也会一起消失）。把故障隔离在单个连接内，
+// 避免一个畸形或恶意客户端造成全局拒绝服务。
+func (s *DataChannelServer) goSafe(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("💥 [%s] panic 已被捕获: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
 }
 
 func (s *DataChannelServer) handleDataConn(conn *quic.Conn) {
@@ -509,9 +753,40 @@ func (s *DataChannelServer) handleDataConn(conn *quic.Conn) {
 		return
 	}
 	connType := strings.TrimSpace(parts[0])
-	mode := strings.TrimSpace(parts[1])
+	clientMode := strings.TrimSpace(parts[1]) // 客户端自报，仅用于日志
 	username := strings.TrimSpace(parts[2])
 	vipStr := strings.TrimSpace(parts[3])
+
+	// ⭐ 安全审计 S1（Critical）：注册帧里的 mode/username/vip 全部由客户端自报，
+	// 而 h3-data / h3-ctrl 这两条连接从不经过认证器。
+	// 原来服务端直接采信，于是：
+	//   - 无混淆时任何人不需要口令就能入网；
+	//   - 注册别人的 VIP 会覆盖对方的 cs.tcpStream → 完整劫持；
+	//   - mode 自报为 single 就不计流量 → 配额形同虚设。
+	// 现在必须用服务端在认证阶段记录的身份来校验：
+	// peerIP 来自 QUIC 连接（不可伪造），username 必须对应一个刚从该 IP
+	// 认证成功的会话，vip 必须是服务端真的租出过、且未被其他会话占用的地址。
+	if s.auth == nil {
+		log.Printf("❌ [服务端] 认证器未初始化，拒绝数据面注册")
+		ctrlStream.Close()
+		conn.CloseWithError(0, "authorizer unavailable")
+		return
+	}
+	peerIP := peerIPOf(conn)
+	serverMode, authorized := s.auth.AuthorizeDataPlane(peerIP, username, vipStr)
+	if !authorized {
+		log.Printf("🚫 [安全] 拒绝未授权的数据面注册: type=%s peer=%s user=%q vip=%q",
+			connType, peerIP, username, vipStr)
+		ctrlStream.Close()
+		conn.CloseWithError(0, "unauthorized")
+		return
+	}
+	if clientMode != serverMode {
+		log.Printf("ℹ️ [安全] 客户端自报 mode=%q，服务端按 %q 处理 (%s)",
+			clientMode, serverMode, username)
+	}
+	// ⭐ 一律使用服务端认定的模式，客户端无法通过自报绕过流量统计
+	mode := serverMode
 
 	switch connType {
 	case "data":
@@ -529,17 +804,25 @@ func (s *DataChannelServer) handleDataConn(conn *quic.Conn) {
 	}
 }
 
+// peerIPOf 提取 QUIC 连接的对端 IP（不可被客户端伪造）
+func peerIPOf(conn *quic.Conn) string {
+	addr := conn.RemoteAddr()
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		return udpAddr.IP.String()
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
+}
+
 func (s *DataChannelServer) handleBulkDataConn(
 	conn *quic.Conn, ctrlStream *quic.Stream,
 	acceptCtx context.Context, mode, username, vipStr string) {
 
-	if username == "" {
-		if remoteAddr, ok := conn.RemoteAddr().(*net.UDPAddr); ok {
-			username = remoteAddr.IP.String()
-		} else {
-			username = "unknown-" + vipStr
-		}
-	}
+	// ⭐ 安全审计 S1：username 已由 AuthorizeDataPlane 校验过（对应一个
+	// 刚从同一 peerIP 认证成功的会话），这里不再需要「用对端 IP 兜底」。
+	peerIP := peerIPOf(conn)
 
 	parsedIP := net.ParseIP(vipStr)
 	if parsedIP == nil {
@@ -556,7 +839,8 @@ func (s *DataChannelServer) handleBulkDataConn(
 	var vipBytes [4]byte
 	copy(vipBytes[:], ip4)
 
-	log.Printf("✅ [服务端] bulk 控制流: mode=%s user=%s VIP=%s", mode, username, vipStr)
+	log.Printf("✅ [服务端] bulk 控制流: mode=%s user=%s VIP=%s peer=%s",
+		mode, username, vipStr, peerIP)
 
 	tcpStream, err := conn.AcceptStream(acceptCtx)
 	if err != nil {
@@ -572,57 +856,64 @@ func (s *DataChannelServer) handleBulkDataConn(
 		return
 	}
 
+	// ⭐ 安全审计 S7：该 VIP 已被活跃数据面认领，租约不再参与过期回收
+	if s.ipAllocator != nil {
+		s.ipAllocator.MarkLeaseActive(vipStr)
+	}
+
 	cs, ok := s.lookup(vipBytes)
 	if ok {
-		cs.dataConn = conn
-		cs.tcpStream = tcpStream
-		cs.udpStream = udpStream
+		// ⭐ 安全审计 S10：同一 VIP 重复注册时，先关掉旧 dataConn 再替换流指针。
+		// 否则两条连接会同时向同一个 clientStream 写入，
+		// 造成 QUIC 流上帧交错、数据损坏；旧连接的 deferred 清理也
+		// 会因为 unregisterData 的 cur != cs 检查而正确地不再释放 IP。
+		if old := cs.getDataConn(); old != nil && old != conn {
+			_ = old.CloseWithError(0, "replaced by new data conn")
+		}
+		cs.setBulkStreams(conn, tcpStream, udpStream)
 	} else {
 		cs = &clientStream{
-			vip:       vipStr,
-			vipBytes:  vipBytes,
-			username:  username,
-			mode:      mode,
-			dataConn:  conn,
-			tcpStream: tcpStream,
-			udpStream: udpStream,
-			lastSeen:  time.Now(),
+			vip:      vipStr,
+			vipBytes: vipBytes,
+			username: username,
+			mode:     mode,
+			peerIP:   peerIP,
+			lastSeen: time.Now(),
 		}
+		cs.setBulkStreams(conn, tcpStream, udpStream)
 		s.register(vipBytes, cs)
 		if s.adminState != nil {
-			s.adminState.OnConnect(username, username, mode, vipStr, conn.RemoteAddr().String())
+			// ⭐ 在线列表按 **VIP**（每连接唯一）作键，而不是用户名 ——
+			//    否则同一账号被多个客户端共用时会互相覆盖。
+			s.adminState.OnConnect(vipStr, username, mode, vipStr, conn.RemoteAddr().String())
 		}
 		log.Printf("✅ bulk 数据面已建立: %s (mode=%s, 在线 %d)", username, mode, s.count())
 	}
 
-	go s.readTCPStream(tcpStream, cs)
-	go s.readUDPStream(udpStream, cs)
+	s.goSafe("readTCPStream", func() { s.readTCPStream(tcpStream, cs) })
+	s.goSafe("readUDPStream", func() { s.readUDPStream(udpStream, cs) })
 
 	defer func() {
 		if s.unregisterData(vipBytes, cs) {
 			if s.ipAllocator != nil {
 				s.ipAllocator.ReleaseByVirtualIP(vipStr)
 			}
+			// ⭐ 安全审计 S1：只释放本连接占用的 VIP；
+			//    同一账号/同一出口 IP 下其它客户端的 VIP 不受影响。
+			if s.auth != nil {
+				s.auth.releaseSession(peerIP, username, vipStr)
+			}
 			if s.adminState != nil {
-				s.adminState.OnDisconnect(username)
+				s.adminState.OnDisconnect(vipStr)
 			}
 			log.Printf("bulk 数据面断开: %s (在线 %d)", username, s.count())
 		}
+		// ⭐ 安全审计 S10：统一注销其余各个面，再关闭本地流。
+		// clearXxx 会先清就绪标志再置空指针，读者不会看到半更新状态。
+		cs.closeAll("data conn closed")
 		tcpStream.Close()
 		udpStream.Close()
 		ctrlStream.Close()
-		if cs.matchConn != nil {
-			_ = cs.matchConn.CloseWithError(0, "data conn closed")
-		}
-		if cs.gameTCPConn != nil {
-			_ = cs.gameTCPConn.CloseWithError(0, "data conn closed")
-		}
-		if cs.gameConn != nil {
-			_ = cs.gameConn.CloseWithError(0, "data conn closed")
-		}
-		if cs.ctrlConn != nil {
-			_ = cs.ctrlConn.CloseWithError(0, "data conn closed")
-		}
 	}()
 
 	<-conn.Context().Done()
@@ -650,13 +941,8 @@ func (s *DataChannelServer) handleMatchConn(
 	var vipBytes [4]byte
 	copy(vipBytes[:], ip4)
 
-	if username == "" {
-		if ra, ok := conn.RemoteAddr().(*net.UDPAddr); ok {
-			username = ra.IP.String()
-		} else {
-			username = "unknown-" + vipStr
-		}
-	}
+	// ⭐ 安全审计 S1：username 已由 AuthorizeDataPlane 校验过，
+	// 不再需要用对端 IP 兜底（原来的兜底会让未认证连接也能伪造一个身份）。
 
 	matchStream, err := conn.AcceptStream(acceptCtx)
 	if err != nil {
@@ -690,15 +976,13 @@ func (s *DataChannelServer) handleMatchConn(
 		return
 	}
 
-	cs.matchConn = conn
-	cs.matchStream = matchStream
+	cs.setMatch(conn, matchStream)
 	log.Printf("✅ [服务端] 匹配面已关联: %s", username)
 
-	go s.readMatchStream(matchStream, cs)
+	s.goSafe("readMatchStream", func() { s.readMatchStream(matchStream, cs) })
 
 	defer func() {
-		cs.matchStream = nil
-		cs.matchConn = nil
+		cs.clearMatch()
 		matchStream.Close()
 		ctrlStream.Close()
 		log.Printf("匹配面断开: %s", username)
@@ -736,13 +1020,8 @@ func (s *DataChannelServer) handleGameTCPConn(
 	var vipBytes [4]byte
 	copy(vipBytes[:], ip4)
 
-	if username == "" {
-		if ra, ok := conn.RemoteAddr().(*net.UDPAddr); ok {
-			username = ra.IP.String()
-		} else {
-			username = "unknown-" + vipStr
-		}
-	}
+	// ⭐ 安全审计 S1：username 已由 AuthorizeDataPlane 校验过，
+	// 不再需要用对端 IP 兜底（原来的兜底会让未认证连接也能伪造一个身份）。
 
 	gameTCPStream, err := conn.AcceptStream(acceptCtx)
 	if err != nil {
@@ -776,15 +1055,13 @@ func (s *DataChannelServer) handleGameTCPConn(
 		return
 	}
 
-	cs.gameTCPConn = conn
-	cs.gameTCPStream = gameTCPStream
+	cs.setGameTCP(conn, gameTCPStream)
 	log.Printf("✅ [服务端] 游戏 TCP 面已关联: %s", username)
 
-	go s.readGameTCPStream(gameTCPStream, cs)
+	s.goSafe("readGameTCPStream", func() { s.readGameTCPStream(gameTCPStream, cs) })
 
 	defer func() {
-		cs.gameTCPStream = nil
-		cs.gameTCPConn = nil
+		cs.clearGameTCP()
 		gameTCPStream.Close()
 		ctrlStream.Close()
 		log.Printf("游戏 TCP 面断开: %s", username)
@@ -818,13 +1095,8 @@ func (s *DataChannelServer) handleGameDatagramConn(
 	var vipBytes [4]byte
 	copy(vipBytes[:], ip4)
 
-	if username == "" {
-		if ra, ok := conn.RemoteAddr().(*net.UDPAddr); ok {
-			username = ra.IP.String()
-		} else {
-			username = "unknown-" + vipStr
-		}
-	}
+	// ⭐ 安全审计 S1：username 已由 AuthorizeDataPlane 校验过，
+	// 不再需要用对端 IP 兜底（原来的兜底会让未认证连接也能伪造一个身份）。
 
 	// ⭐ 接受 datagram 协商流（对应客户端第二条 stream）
 	dgStream, err := conn.AcceptStream(acceptCtx)
@@ -882,17 +1154,15 @@ func (s *DataChannelServer) handleGameDatagramConn(
 	}
 	_ = dgStream.Close()
 
-	cs.gameConn = conn
-	cs.gameDatagramReady.Store(true)
+	cs.setGame(conn)
 	log.Printf("✅ [服务端] 游戏 UDP 面已关联: %s（Datagram 已启用）", username)
 
 	if len(s.udpUnreliablePorts) > 0 {
-		go s.handleGameDatagrams(conn, cs, username)
+		s.goSafe("handleGameDatagrams", func() { s.handleGameDatagrams(conn, cs, username) })
 	}
 
 	defer func() {
-		cs.gameConn = nil
-		cs.gameDatagramReady.Store(false)
+		cs.clearGame()
 		ctrlStream.Close()
 		log.Printf("游戏 UDP 面断开: %s", username)
 	}()
@@ -901,7 +1171,7 @@ func (s *DataChannelServer) handleGameDatagramConn(
 }
 
 func (s *DataChannelServer) HandleCtrlConn(conn *quic.Conn) {
-	go s.handleCtrlConn(conn)
+	s.goSafe("handleCtrlConn", func() { s.handleCtrlConn(conn) })
 }
 
 func (s *DataChannelServer) handleCtrlConn(conn *quic.Conn) {
@@ -986,21 +1256,15 @@ func (s *DataChannelServer) handleCtrlConn(conn *quic.Conn) {
 		return
 	}
 
-	cs.ctrlConn = conn
-	cs.icmpStream = icmpStream
-	cs.hbStream = hbStream
-	cs.ctrlReady.Store(true)
+	cs.setCtrl(conn, icmpStream, hbStream)
 
 	log.Printf("✅ 控制面已关联: %s", username)
 
-	go s.readICMPStream(icmpStream, cs)
-	go s.handleHeartbeatStream(hbStream, cs)
+	s.goSafe("readICMPStream", func() { s.readICMPStream(icmpStream, cs) })
+	s.goSafe("handleHeartbeatStream", func() { s.handleHeartbeatStream(hbStream, cs) })
 
 	defer func() {
-		cs.ctrlReady.Store(false)
-		cs.icmpStream = nil
-		cs.hbStream = nil
-		cs.ctrlConn = nil
+		cs.clearCtrl()
 		icmpStream.Close()
 		hbStream.Close()
 		ctrlStream.Close()
@@ -1194,8 +1458,10 @@ func (s *DataChannelServer) handleGameDatagrams(conn *quic.Conn, cs *clientStrea
 			continue
 		}
 		// ⭐ 对战 UDP：转发到对端 gameConn datagram
-		if dst.gameDatagramReady.Load() && dst.gameConn != nil {
-			if err := dst.gameConn.SendDatagram(pkt); err != nil {
+		// ⭐ 安全审计 S10：用 getGameConn 一次性取值，
+		//    原来「先 Load 标志、再用指针」在两者之间可能被置 nil → panic。
+		if gc := dst.getGameConn(); gc != nil {
+			if err := gc.SendDatagram(pkt); err != nil {
 				if debugMode {
 					log.Printf("⚠️ [服务端] Datagram 转发失败: %v", err)
 				}
@@ -1249,7 +1515,7 @@ func (s *DataChannelServer) readUDPStream(stream *quic.Stream, cs *clientStream)
 		}
 
 		// ⭐ 保底：客户端可能没升级，把匹配端口也从 dataConn 走
-		if dstPort, ok := extractUDPDstPort(pkt); ok && s.isUDPMatchPort(dstPort) && dst.matchStream != nil {
+		if dstPort, ok := extractUDPDstPort(pkt); ok && s.isUDPMatchPort(dstPort) && dst.getMatchStream() != nil {
 			if err := dst.writeMatchFrame(pkt); err != nil {
 				log.Printf("Match 转发到 %s 失败: %v", ipToString(dstIP), err)
 				continue
@@ -1339,6 +1605,14 @@ func (s *DataChannelServer) TunWriteLoop() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
+			// ⭐ 安全审计 S10：TUN 写 worker 是全局协程，
+			// 一次 panic 会带走整个进程，必须兜底。
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("💥 [TunWriteLoop worker=%d] panic 已被捕获: %v\n%s",
+						workerID, r, debug.Stack())
+				}
+			}()
 			for {
 				select {
 				case <-s.ctx.Done():
@@ -1367,6 +1641,12 @@ func (s *DataChannelServer) ServerTunReadLoop() {
 	if s.serverTun == nil {
 		return
 	}
+	// ⭐ 安全审计 S10：这是全局协程，panic 会带走整个服务端进程
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("💥 [ServerTunReadLoop] panic 已被捕获: %v\n%s", r, debug.Stack())
+		}
+	}()
 	log.Printf("🔄 [服务端] TUN 读循环已启动")
 	for {
 		select {
@@ -1412,13 +1692,16 @@ func (s *DataChannelServer) ServerTunReadLoop() {
 			var handled bool
 			if srcPort, ok := extractUDPSrcPort(pkt); ok {
 				// 匹配端口 → matchConn
-				if s.isUDPMatchPort(srcPort) && dst.matchStream != nil {
+				// ⭐ 安全审计 S10：getMatchStream/getGameConn 都是原子的 nil 检查
+				if s.isUDPMatchPort(srcPort) && dst.getMatchStream() != nil {
 					err2 = dst.writeMatchFrame(pkt)
 					handled = true
-				} else if s.isUDPUnreliablePort(srcPort) && dst.gameDatagramReady.Load() && dst.gameConn != nil {
+				} else if s.isUDPUnreliablePort(srcPort) {
 					// 对战端口 → gameConn datagram
-					err2 = dst.gameConn.SendDatagram(pkt)
-					handled = true
+					if gc := dst.getGameConn(); gc != nil {
+						err2 = gc.SendDatagram(pkt)
+						handled = true
+					}
 				}
 			}
 			if !handled {
@@ -1468,7 +1751,8 @@ func (s *DataChannelServer) handleHeartbeatStream(stream *quic.Stream, cs *clien
 					ms = 0
 				}
 				if s.adminState != nil && cs.username != "" {
-					s.adminState.SetClientLatency(cs.username, ms)
+					// ⭐ 按 VIP 作键，支持同一账号多客户端各自的延迟显示
+					s.adminState.SetClientLatency(cs.vip, ms)
 				}
 			}
 			if err := cs.writeHeartbeatFrame(hbTypePong, nil); err != nil {
@@ -1483,10 +1767,16 @@ func (s *DataChannelServer) handleHeartbeatStream(stream *quic.Stream, cs *clien
 func (s *DataChannelServer) recordTraffic(cs, dst *clientStream, size int) {
 	if s.adminState != nil {
 		u := uint64(size)
-		s.adminState.AddTraffic(cs.username, u, 0)
-		s.adminState.AddTraffic(dst.username, 0, u)
+		// ⭐ 在线统计按 VIP（每连接唯一）作键，支持同一账号多客户端共存
+		s.adminState.AddTraffic(cs.vip, u, 0)
+		s.adminState.AddTraffic(dst.vip, 0, u)
 	}
-	if cs.mode == "multi" && s.userStore != nil {
+	// ⭐ 安全审计 S1：原来这里是 `if cs.mode == "multi"`，
+	// 而 mode 由客户端在注册帧里自报 —— 改成 "single" 就完全不计流量，
+	// 配额/到期策略形同虚设。现在 mode 一律取服务端认定的值
+	// （全局密码已移除，所有会话都是多用户模式），因此无条件计账。
+	// 同一账号被多客户端共用时，流量累计到该账号（共用一个配额）。
+	if s.userStore != nil {
 		s.userStore.AddTraffic(cs.username, uint64(size))
 	}
 }

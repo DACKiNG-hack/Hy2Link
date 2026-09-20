@@ -1,10 +1,13 @@
 //go:build windows
 
+//tray_windows.go
+
 package main
 
 import (
 	_ "embed"
 	"log"
+	"runtime"
 	"sync"
 
 	"github.com/energye/systray"
@@ -19,9 +22,26 @@ var (
 	trayMenuToggle *systray.MenuItem
 )
 
-// startTray 启动托盘（阻塞在 systray.Run，需在 goroutine 里调用）
+// ⭐ 托盘回调安全包装：异步执行 + recover
+func safeCall(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️ [托盘] %s panic: %v", name, r)
+			}
+		}()
+		fn()
+	}()
+}
+
+// startTray 启动托盘
 func startTray(app *App) {
 	go func() {
+		// ⭐ 关键：systray 需要独占一个 OS 线程
+		//    Windows 的消息泵必须绑定到固定线程，否则跑一段时间后消息会丢失
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
 		systray.Run(
 			func() { onTrayReady(app) },
 			func() { log.Println("🔚 [托盘] 已退出") },
@@ -30,66 +50,87 @@ func startTray(app *App) {
 }
 
 func onTrayReady(app *App) {
+	log.Println("🖱️ [托盘] 初始化中...")
+
 	systray.SetIcon(trayIcon)
 	systray.SetTitle("Hy2Link")
 	systray.SetTooltip("Hy2Link · 未连接")
 
-	// ⭐ 左键单击：切换窗口显示/隐藏
+	// ⭐ 所有点击回调都异步执行，避免阻塞消息泵
 	systray.SetOnClick(func(menu systray.IMenu) {
-		app.ToggleWindowVisibility()
+		safeCall("OnClick", func() {
+			app.ToggleWindowVisibility()
+		})
 	})
 
-	// ⭐ 左键双击：同上
 	systray.SetOnDClick(func(menu systray.IMenu) {
-		app.ToggleWindowVisibility()
+		safeCall("OnDClick", func() {
+			app.ToggleWindowVisibility()
+		})
 	})
 
-	// ⭐ 右键单击：弹出菜单
+	// ⚠️ RClick 的 menu.ShowMenu() 不能异步，
+	//    它是 systray 内部 API，必须在消息泵线程调用
 	systray.SetOnRClick(func(menu systray.IMenu) {
 		menu.ShowMenu()
 	})
 
-	// ========== 右键菜单项（回调方式） ==========
+	// ========== 右键菜单项 ==========
 	mShow := systray.AddMenuItem("显示主窗口", "打开主界面")
 	mShow.Click(func() {
-		app.ShowWindowFromTray()
+		safeCall("ShowWindow", func() {
+			app.ShowWindowFromTray()
+		})
 	})
 
 	trayMenuToggle = systray.AddMenuItem("连接", "连接 / 断开")
 	trayMenuToggle.Click(func() {
-		app.ToggleConnectionFromTray()
+		safeCall("ToggleConnection", func() {
+			app.ToggleConnectionFromTray()
+		})
 	})
 
 	systray.AddSeparator()
 
 	mQuit := systray.AddMenuItem("退出", "完全退出客户端")
 	mQuit.Click(func() {
-		app.QuitFromTray()
+		safeCall("Quit", func() {
+			app.QuitFromTray()
+		})
 	})
 
 	trayReadyOnce.Do(func() { close(trayReady) })
 
-	// ⭐ 阻塞当前 goroutine，让托盘保持运行
-	// 事件通过上面的 Click 回调处理，不需要循环监听
-	select {}
+	log.Println("✅ [托盘] 已就绪")
+
+	// ⭐ 去掉 select {}，让 onReady 正常返回
+	//    systray 内部会接管消息循环
 }
 
 // updateTrayStatus 由 App 在连接状态变化时调用
 func updateTrayStatus(connected bool) {
 	select {
 	case <-trayReady:
-		// 托盘已就绪
 	default:
-		return // 托盘还没起来，忽略
+		return
 	}
 	if trayMenuToggle == nil {
 		return
 	}
-	if connected {
-		systray.SetTooltip("Hy2Link · 已连接")
-		trayMenuToggle.SetTitle("断开")
-	} else {
-		systray.SetTooltip("Hy2Link · 未连接")
-		trayMenuToggle.SetTitle("连接")
-	}
+
+	// ⭐ 异步更新，避免阻塞调用方
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️ [托盘] updateTrayStatus panic: %v", r)
+			}
+		}()
+		if connected {
+			systray.SetTooltip("Hy2Link · 已连接")
+			trayMenuToggle.SetTitle("断开")
+		} else {
+			systray.SetTooltip("Hy2Link · 未连接")
+			trayMenuToggle.SetTitle("连接")
+		}
+	}()
 }

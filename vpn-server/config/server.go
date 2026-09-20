@@ -70,12 +70,20 @@ func DefaultConfig() *ServerConfig {
 		ServerTunIP:      "192.168.30.10",
 		ServerTunMask:    "255.255.255.0",
 
+		// ⭐ 默认全部关闭：
+		//   - TCP 连接拆分：把 tcpSplitPorts 上的 TCP 走独立 BBR 连接
+		//   - UDP 可靠（匹配端口）：走独立 matchConn（Cubic）
+		//   - UDP 不可靠（对战端口）：走 QUIC Datagram
+		// 这三项都是「低延迟优化」而非必需功能，默认关闭可以让
+		// 新装服务端先用最简单的一条 bulk 数据面跑通，
+		// 需要时再在面板里按需开启。
+		// 注意：端口列表仍然保留，开启时无需重新填写。
 		TCPSplitEnabled: false,
 		TCPSplitPorts:   []int{22345, 443},
 
-		UDPReliableEnabled:   true,
+		UDPReliableEnabled:   false,
 		UDPReliablePorts:     []string{"42300-42800"},
-		UDPUnreliableEnabled: true,
+		UDPUnreliableEnabled: false,
 		UDPUnreliablePorts:   []string{"50000-50550"},
 
 		MinClientVersion: "",

@@ -6,7 +6,9 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -66,7 +68,9 @@ func main() {
 	// Windows 下释放 wintun.dll
 	if runtime.GOOS == "windows" {
 		if err := ensureWintunDLL(); err != nil {
-			log.Printf("警告: 释放 wintun.dll 失败: %v", err)
+			// ⭐ 安全审计 S12：完整性无法确认时必须显式告警
+			log.Printf("🚨 [安全] wintun.dll 完整性校验/释放失败: %v", err)
+			log.Printf("     若程序目录可被普通用户写入，请改用管理员专属目录（如 Program Files）安装。")
 		} else {
 			log.Println("wintun.dll 已就绪")
 		}
@@ -142,6 +146,12 @@ func sendInstanceSignal(msg instanceMsg) error {
 	return err
 }
 
+// ipcMaxConcurrent 限制并发处理的 IPC 连接数。
+// ⭐ 安全审计 S16：原实现每条连接一个 goroutine 且没有读超时，
+// 本地任意进程都能开成千上万个连接，每个钉住一个 goroutine + 8 KiB，
+// 直至内存/句柄耗尽。
+const ipcMaxConcurrent = 8
+
 func startActivationListener(app *App) {
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", instancePort))
 	if err != nil {
@@ -149,31 +159,46 @@ func startActivationListener(app *App) {
 		return
 	}
 	defer listener.Close()
+
+	sem := make(chan struct{}, ipcMaxConcurrent)
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// ⭐ 安全审计 S16/S41：原实现无条件 continue，
+			// 监听器一旦永久性出错就变成 100% CPU 忙循环。
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("⚠️ [IPC] Accept 失败: %v", err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
+
+		select {
+		case sem <- struct{}{}:
+		default:
+			log.Printf("⚠️ [IPC] 并发连接已达上限，拒绝 %s", conn.RemoteAddr())
+			_ = conn.Close()
+			continue
+		}
+
 		go func(c net.Conn) {
+			defer func() { <-sem }()
 			defer c.Close()
 
-			buf := make([]byte, 8192)
-			n, err := c.Read(buf)
-			if err != nil || n == 0 {
-				app.ActivateWindow()
-				return
-			}
+			// ⭐ 安全审计 S16：必须设置读超时，
+			// 否则连接可以被无限期挂住（每个连接占一个 goroutine）。
+			_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
 
-			text := strings.TrimSpace(string(buf[:n]))
-
-			// 兼容旧版纯文本协议
-			if text == "ACTIVATE" {
-				app.ActivateWindow()
-				return
-			}
-
+			// ⭐ 安全审计 S16：用 json.Decoder 读取**一个完整 JSON 对象**。
+			// 原来只调用一次 c.Read()，TCP 分包时 JSON 会被截断，
+			// json.Unmarshal 失败后静默降级为「只激活窗口」，
+			// 用户的导入请求被悄悄丢弃。
 			var msg instanceMsg
-			if err := json.Unmarshal(buf[:n], &msg); err != nil {
+			dec := json.NewDecoder(io.LimitReader(c, 64*1024))
+			if err := dec.Decode(&msg); err != nil {
+				// 兼容旧版纯文本协议（发送 "ACTIVATE" 时 JSON 解码必然失败）
 				app.ActivateWindow()
 				return
 			}

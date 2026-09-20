@@ -63,7 +63,6 @@ const app = createApp({
         const tab = ref('server');
         const clients = ref([]);
         const users = ref([]);
-        const globalPwd = ref('');
         const editUser = ref(null);
         const busy = ref(false);
         const pwdForm = ref({ oldPassword: '', newPassword: '', confirmPassword: '' });
@@ -257,7 +256,6 @@ const app = createApp({
             await loadServer();
             await syncCfg(true);
             await loadUsers();
-            await loadGlobalPwd();
             await loadGeo();
             await loadPerformance();
             await loadMetrics();
@@ -309,13 +307,6 @@ const app = createApp({
 
         async function loadUsers() {
             try { users.value = await api('/api/users'); } catch (e) { console.warn(e); }
-        }
-
-        async function loadGlobalPwd() {
-            try {
-                const r = await api('/api/global-password');
-                globalPwd.value = r.password;
-            } catch (e) { console.warn(e); }
         }
 
         async function loadGeo() {
@@ -725,16 +716,15 @@ const app = createApp({
             try { await api('/api/users/' + encodeURIComponent(u.username), { method: 'DELETE' }); await loadUsers(); }
             catch (e) { alert(t('users.deleteFail') + '：' + e.message); }
         }
-        async function kick(username) {
-            if (!confirm(t('clients.kickConfirm', { name: username }))) return;
-            try { await api('/api/clients/kick?username=' + encodeURIComponent(username), { method: 'POST' }); }
+        // ⭐ 一个账号可以被多个客户端共用，因此按 VIP 精确踢出单个连接；
+        //    vip 为空时退回「踢掉该账号的全部连接」。
+        async function kick(username, vip) {
+            const label = vip ? `${username}（${vip}）` : username;
+            if (!confirm(t('clients.kickConfirm', { name: label }))) return;
+            let url = '/api/clients/kick?username=' + encodeURIComponent(username || '');
+            if (vip) url += '&vip=' + encodeURIComponent(vip);
+            try { await api(url, { method: 'POST' }); }
             catch (e) { alert(t('clients.kickFail') + '：' + e.message); }
-        }
-        async function saveGlobalPwd() {
-            try {
-                await api('/api/global-password', { method: 'PUT', body: JSON.stringify({ password: globalPwd.value }) });
-                alert(t('settings.saved'));
-            } catch (e) { alert(t('settings.saveFail') + '：' + e.message); }
         }
         async function changePassword() {
             const f = pwdForm.value;
@@ -852,14 +842,14 @@ const app = createApp({
             initChecked, initialized,
             setupForm, setupMsg, setupOk, setupBusy, doSetup,
             version, token, currentUser, loginForm, loginMsg, loginOk, logging,
-            tab, clients, users, globalPwd, editUser, busy, server, cfg, dirty, pwdForm,
+            tab, clients, users, editUser, busy, server, cfg, dirty, pwdForm,
             geo, geoCountriesInput, geoSaving,
             perf, perfSaving,
             certInfo, certStatusError, certCfg, certDirty, certBusy,
             loadCertStatus, loadCertConfig, saveCertConfig, regenerateCert, copyFingerprint,
             onlineChart, trafficChart,
             login, logout, startServer, stopServer, restartServer, saveConfig, resetConfig, syncCfg,
-            openCreateUser, openEditUser, saveUser, deleteUser, kick, saveGlobalPwd, changePassword,
+            openCreateUser, openEditUser, saveUser, deleteUser, kick, changePassword,
             loadGeo, saveGeo,
             loadPerformance, savePerformance,
             loadMetrics,

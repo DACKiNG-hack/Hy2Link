@@ -28,7 +28,16 @@ func main() {
 
 	if runtime.GOOS == "windows" {
 		if err := ensureWintunDLL(); err != nil {
-			log.Printf("警告: 释放 wintun.dll 失败: %v", err)
+			// ⭐ 安全审计 S12：校验失败意味着 DLL 完整性无法确认
+			//    （被顶替、被占用无法覆盖等），必须显式告警而不是轻描淡写。
+			log.Printf("🚨 [安全] wintun.dll 完整性校验/释放失败: %v", err)
+			log.Printf("     若程序目录可被普通用户写入，请改用管理员专属目录（如 Program Files）安装。")
+			// 异步弹窗，避免阻塞启动流程
+			go showMsgBox("安全警告",
+				"wintun.dll 完整性校验失败：\n\n"+err.Error()+
+					"\n\n程序目录可能被其他用户写入，存在 DLL 劫持风险。\n"+
+					"建议把程序安装到 Program Files 后重新启动。\n\n"+
+					"（注意：若 wintun.dll 正被其他进程占用，重启系统后再试。）")
 		}
 	}
 
@@ -87,8 +96,9 @@ func main() {
 	}
 
 	if hasConsole {
-		fmt.Printf("👥 用户: %s (全局密码: %s, 多用户数: %d)\n",
-			usersFile, userStore.GetGlobalPassword(), len(userStore.List()))
+		fmt.Printf("👥 用户存储: %s（多用户数: %d）\n",
+			usersFile, len(userStore.List()))
+		fmt.Println("🔐 认证方式: 仅多用户模式（客户端必须填写「用户名 + 密码」）")
 	}
 
 	stopFlush := make(chan struct{})

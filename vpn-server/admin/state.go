@@ -35,7 +35,11 @@ func NewAdminState(version string) *AdminState {
 	}
 }
 
-// ⭐ 5 个参数
+// OnConnect 登记一个在线客户端。
+//
+// key 必须是**每连接唯一**的值（调用方传的是虚拟 IP）。
+// ⚠️ 不要用用户名作 key：一个账号允许被多个客户端共用，
+// 用用户名会互相覆盖，也会导致断开其中一个就把另一个从列表里删掉。
 func (s *AdminState) OnConnect(key, username, mode, vip, realAddr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

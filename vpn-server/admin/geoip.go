@@ -15,17 +15,27 @@ type GeoFilter struct {
 	mode         string          // "off" / "block" / "allow"
 	countries    map[string]bool // 大写国家代码集合
 	blockPrivate bool
+	resolver     *ipResolver // ⭐ 安全审计 S5：真实客户端 IP 的解析策略
 }
 
 func NewGeoFilter(mode string, countries []string, blockPrivate bool) *GeoFilter {
+	return NewGeoFilterWithResolver(mode, countries, blockPrivate, defaultIPResolver)
+}
+
+// NewGeoFilterWithResolver 允许注入自定义的客户端 IP 解析策略
+func NewGeoFilterWithResolver(mode string, countries []string, blockPrivate bool, resolver *ipResolver) *GeoFilter {
 	set := make(map[string]bool, len(countries))
 	for _, c := range countries {
 		set[strings.ToUpper(strings.TrimSpace(c))] = true
+	}
+	if resolver == nil {
+		resolver = defaultIPResolver
 	}
 	return &GeoFilter{
 		mode:         mode,
 		countries:    set,
 		blockPrivate: blockPrivate,
+		resolver:     resolver,
 	}
 }
 
@@ -40,7 +50,9 @@ func (g *GeoFilter) Middleware(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ipStr := extractClientIP(r)
+		// ⭐ 安全审计 S5：这里必须用「不可伪造」的客户端 IP。
+		//    默认只用 TCP 层对端地址；只有对端是配置好的受信代理时才会解析 XFF。
+		ipStr := g.resolver.ClientIP(r)
 		ip := net.ParseIP(ipStr)
 
 		// ⭐ 本机 loopback 始终放行
@@ -130,21 +142,105 @@ func (g *GeoFilter) Describe() string {
 
 // ---------- 工具 ----------
 
-func extractClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if idx := strings.Index(xff, ","); idx > 0 {
-			return strings.TrimSpace(xff[:idx])
-		}
-		return strings.TrimSpace(xff)
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
+// ipResolver 决定「真实客户端 IP」。
+//
+// ⭐ 安全审计 S5：默认**不信任**任何转发头。
+//
+// 原来的实现无条件信任 X-Forwarded-For / X-Real-IP，导致两个真实漏洞：
+//  1. 地理围栏绕过：`X-Forwarded-For: 127.0.0.1` 会被判定为 loopback 而直接放行；
+//  2. 登录爆破：限流按 IP 计数，攻击者每次请求换一个 XFF 值即可无限尝试。
+//
+// 正确做法：只有 TCP 层对端确实是配置好的受信反向代理时，才去看 XFF，
+// 并且从**右往左**剥离受信代理，取第一个非受信地址——
+// 因为 XFF 最左边的值才是客户端可以随意伪造的部分。
+type ipResolver struct {
+	trusted []netip.Prefix
 }
+
+// newIPResolver 解析逗号分隔的受信代理列表，支持 CIDR 或单个 IP。
+// 传空字符串表示「没有任何受信代理」（默认，也是推荐配置）。
+func newIPResolver(spec string) *ipResolver {
+	r := &ipResolver{}
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(part); err == nil {
+			r.trusted = append(r.trusted, p.Masked())
+			continue
+		}
+		if a, err := netip.ParseAddr(part); err == nil {
+			a = a.Unmap()
+			r.trusted = append(r.trusted, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return r
+}
+
+func (r *ipResolver) trusts(a netip.Addr) bool {
+	if r == nil || len(r.trusted) == 0 || !a.IsValid() {
+		return false
+	}
+	a = a.Unmap()
+	for _, p := range r.trusted {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// peerAddr 提取 TCP 层真实对端地址，不解析任何请求头。
+func peerAddr(remoteAddr string) netip.Addr {
+	host := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	a, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}
+	}
+	return a.Unmap()
+}
+
+// ClientIP 返回用于限流与地理围栏判定的客户端 IP。
+func (r *ipResolver) ClientIP(req *http.Request) string {
+	peer := peerAddr(req.RemoteAddr)
+
+	if peer.IsValid() && r.trusts(peer) {
+		// 只有在受信代理后面才允许转发头生效
+		if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				cand, err := netip.ParseAddr(strings.TrimSpace(parts[i]))
+				if err != nil {
+					continue
+				}
+				cand = cand.Unmap()
+				if !r.trusts(cand) {
+					return cand.String()
+				}
+			}
+		}
+		if xri := req.Header.Get("X-Real-IP"); xri != "" {
+			if a, err := netip.ParseAddr(strings.TrimSpace(xri)); err == nil {
+				return a.Unmap().String()
+			}
+		}
+	}
+
+	if peer.IsValid() {
+		return peer.String()
+	}
+	// 极端情况下（RemoteAddr 无法解析）退回原字符串，
+	// 它仍然是内核提供的对端地址，客户端无法伪造。
+	return req.RemoteAddr
+}
+
+// defaultIPResolver 不信任任何代理，只用 RemoteAddr。
+var defaultIPResolver = newIPResolver("")
 
 func isPrivateIP(ip net.IP) bool {
 	if ip == nil {

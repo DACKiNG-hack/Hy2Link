@@ -2,6 +2,8 @@ package config
 
 // vpn-tool/backend/config/config.go
 type ClientConfig struct {
+	// Name ⭐ 连接名称（用户自定义，仅用于界面显示与 .hy2 分享）
+	Name           string `json:"name"`
 	IP             string `json:"ip"`
 	Port           int    `json:"port"`    // 数据端口（hysteria + h3-data）
 	PortVPN        int    `json:"portVPN"` // 控制端口（h3-ctrl）
