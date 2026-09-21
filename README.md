@@ -50,8 +50,7 @@
 
 ```bash
 cd vpn-server
-go build -o hy2link-server.exe .
-./hy2link-server.exe
+go build -ldflags="-H windowsgui" -o Hy2link-server.exe .
 ```
 
 首次启动自动创建：
