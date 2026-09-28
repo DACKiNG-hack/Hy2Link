@@ -247,6 +247,18 @@ func (a *App) ConnectClient(cfg config.ClientConfig) (string, error) {
 		cfg.SkipCertVerify,
 	)
 	cli.SetObfs(cfg.ObfsEnabled, cfg.ObfsPassword)
+	// ⭐ 1b-2A：本机「禁用 P2P」开关（取反传给 SetP2P）。
+	//    ⚠️ 配置里存的是「禁用」（默认 false = 不禁止），因为 Go bool 零值必须是「启用」语义，
+	//    否则旧配置/旧 .hy2 会静默变成禁用 P2P（详见 config.ClientConfig.P2PDisabled 注释）。
+	cli.SetP2P(!cfg.P2PDisabled)
+	// ⭐ P2SP 阶段 1b：直连状态 → Wails 事件（前端订阅 "p2p:status"）
+	//    只在状态变化时发；失败一律是普通提示，绝不弹阻断式对话框。
+	cli.SetP2PStatusHandler(func(st quic.P2PStatus) {
+		if a.ctx == nil {
+			return
+		}
+		runtime.EventsEmit(a.ctx, "p2p:status", st)
+	})
 
 	// ⭐ 安全审计 S35：登记「正在连接」的客户端，并启动看门狗。
 	//    Connect() 期间 a.quicClient 仍是 nil，Stop() 无法取消它，
@@ -638,6 +650,15 @@ func (a *App) tryReconnect() {
 				cfg.SkipCertVerify,
 			)
 			cli.SetObfs(cfg.ObfsEnabled, cfg.ObfsPassword)
+			// ⭐ 1b-2A：重连时同样带上本机「禁用 P2P」开关（取反）
+			cli.SetP2P(!cfg.P2PDisabled)
+			// ⭐ P2SP 阶段 1b：重连后的直连状态同样推给前端
+			cli.SetP2PStatusHandler(func(st quic.P2PStatus) {
+				if a.ctx == nil {
+					return
+				}
+				runtime.EventsEmit(a.ctx, "p2p:status", st)
+			})
 
 			ip, err := cli.Connect()
 			if err != nil {
@@ -794,4 +815,122 @@ func (a *App) Greet(name string) string {
 
 func (a *App) GetClientVersion() string {
 	return quic.ClientVersion
+}
+
+// ---------- P2SP 阶段 1：隧道内信令（供前端 / 调试使用） ----------
+
+// SignalSelf 返回本机的 P2P 状态与 NAT 探测结果。
+// 用于人工验证「P2P 开关 / NAT 探测 / 信令是否就绪」。
+func (a *App) SignalSelf() map[string]interface{} {
+	a.clientMu.Lock()
+	cli := a.quicClient
+	a.clientMu.Unlock()
+
+	if cli == nil {
+		return map[string]interface{}{"connected": false}
+	}
+	res, ready := cli.NATResult()
+	return map[string]interface{}{
+		"connected":          true,
+		"p2pServerEnabled":   cli.P2PServerEnabled(),
+		"p2pLocalEnabled":    cli.P2PLocalEnabled(),
+		"p2pEffective":       cli.P2PEffective(),
+		"natReady":           ready,
+		"natType":            string(res.Type),
+		"publicAddr":         res.PublicAddr,
+		"observedPorts":      res.ObservedPorts,
+		"respondedServers":   res.RespondedServers,
+		"mappingIndependent": res.MappingIndependent,
+		// ⭐ 本机信令流是否已建好（本地视角）。
+		// 注意与 SignalQuery 返回的 SignalReady 区分：
+		// 那个说的是「**对端**信令就绪、服务端推得过去」。
+		"signalStreamReady": cli.SignalStreamReady(),
+	}
+}
+
+// SignalQuery 通过**隧道内**信令查询对端 VIP 的公网地址与 NAT 类型。
+//
+// 阶段 1a 只做地址交换；阶段 1b 的打洞会用返回的 metadata。
+func (a *App) SignalQuery(peerVIP string) (quic.SignalPeer, error) {
+	a.clientMu.Lock()
+	cli := a.quicClient
+	a.clientMu.Unlock()
+
+	if cli == nil {
+		return quic.SignalPeer{}, fmt.Errorf("尚未连接")
+	}
+	return cli.SignalQuery(peerVIP)
+}
+
+// PunchTo 发起一次到指定对端 VIP 的**直连尝试**（P2SP 阶段 1b-1）。
+//
+// 异步：立即返回 attemptId（用于日志关联），过程中的状态与结果通过
+// "p2p:status" 事件推送（见 P2PStatus）。业务流量在 1b-1 仍走中继。
+func (a *App) PunchTo(peerVIP string) (string, error) {
+	a.clientMu.Lock()
+	cli := a.quicClient
+	a.clientMu.Unlock()
+
+	if cli == nil {
+		return "", fmt.Errorf("尚未连接")
+	}
+	return cli.PunchTo(peerVIP)
+}
+
+// PunchSessionState 查询某次直连尝试的当前状态（诊断/UI 用）
+func (a *App) PunchSessionState(attemptID string) (string, bool) {
+	a.clientMu.Lock()
+	cli := a.quicClient
+	a.clientMu.Unlock()
+
+	if cli == nil {
+		return "", false
+	}
+	return cli.PunchSessionState(attemptID)
+}
+
+// P2PReasonText 原因码 → 中文文案（前端也可以自己映射；这里作为兜底与一致性来源）
+func (a *App) P2PReasonText(code string) string {
+	return quic.P2PReasonText(code)
+}
+
+// P2PPaths 当前直连路径快照（1b-2A：面板「直连对端」列表用）。
+//
+// 每个对端给出：VIP / 状态 / 角色 / 直连 RTT / 已承载的上下行字节 / 建立时刻。
+func (a *App) P2PPaths() []quic.PathInfo {
+	a.clientMu.Lock()
+	cli := a.quicClient
+	a.clientMu.Unlock()
+	if cli == nil {
+		return nil
+	}
+	return cli.P2PPaths()
+}
+
+// P2PTrafficNote 直连流量的计量口径（Q7 定稿：配额 = **中继流量配额**）。
+//
+// ⚠️ 放在后端返回是为了「口径只有一处」：面板与文档都引用它，
+// 避免各处自己写一句不一致的说明（服务端看不到直连字节数，所以这里只能是说明，不能是数字）。
+func (a *App) P2PTrafficNote() string {
+	return "直连流量不经服务端，不计入流量配额（配额统计的是中继流量）"
+}
+
+// SetP2PLocal 本机 P2P 开关（客户端「高级选项 → 禁用 P2P」的运行时入口）。
+//
+// 语义（与验收要求一致）：
+//   - false（禁用）：**立即**清空路由表并关闭已有直连路径 → 流量回中继；
+//   - true （启用）：不主动触发任何打洞，等流量驱动。
+//
+// ⚠️ 与「连接时的配置」是同一份语义：`enabled` 是 **P2P 启用**（不是「禁用」），
+// 前端那个开关是「禁用 P2P」，所以要传 `!disabled`。
+func (a *App) SetP2PLocal(enabled bool) error {
+	a.clientMu.Lock()
+	cli := a.quicClient
+	a.clientMu.Unlock()
+	if cli == nil {
+		// 未连接：只记录到「下一次连接」由配置决定（这里不报错，避免切换开关时弹错误）
+		return nil
+	}
+	cli.ApplyP2PLocal(enabled)
+	return nil
 }

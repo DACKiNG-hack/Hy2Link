@@ -246,7 +246,6 @@
                   />
                 </div>
               </div>
-              <p class="field-hint">{{ t('configUserHint') }}</p>
 
               <details class="adv">
                 <summary>
@@ -257,6 +256,7 @@
                   </span>
                   <span>{{ t('advTitle') }}</span>
                   <span class="adv-badges" v-if="advancedTagCount">
+                    <span v-if="activeConnection?.p2pDisabled" class="tag warn">{{ t('advP2PDisabledTag') }}</span>
                     <span v-if="obfsEnabled" class="tag ok">Salamander</span>
                     <span v-if="skipCertEnabled" class="tag warn">{{ t('advSkipCertTag') }}</span>
                     <span v-else-if="hasPinned" class="tag ok">{{ t('advPinnedTag') }}</span>
@@ -283,6 +283,20 @@
                     />
                   </div>
 
+                  <!-- ⭐ 1b-2A：本机 P2P 开关（本机否决）。
+                       ⚠️ 与其它高级选项不同：**连接中也立即生效**（关掉会立刻清空路由表并
+                       关闭已有直连路径，流量回中继），因为它影响的是本机是否使用直连。 -->
+                  <div class="switch-row">
+                    <div class="switch-info">
+                      <div class="switch-name">{{ t('advDisableP2PName') }}</div>
+                      <div class="switch-desc">{{ t('advDisableP2PDesc') }}</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" v-model="activeConnection.p2pDisabled" @change="onP2PDisabledChange" />
+                      <span class="switch-track"></span>
+                    </label>
+                  </div>
+
                   <div class="switch-row">
                     <div class="switch-info">
                       <div class="switch-name">{{ t('advSkipCertName') }}</div>
@@ -299,6 +313,39 @@
                   </div>
                 </div>
               </details>
+            </div>
+          </div>
+
+          <!-- ⭐ 直连对端卡片（用户可见的最小面）：只展示「谁在直连、多快、走了多少」。
+               验证用的控件（NAT 状态格 / 手动打洞）已从主界面移除 —— 绑定方法仍在，
+               DevServer 控制台或调试版仍可调用（PunchTo / P2PPaths / SignalSelf）。 -->
+          <div class="card">
+            <div class="card-head">
+              <h2>{{ t('p2pPeersTitle') }}</h2>
+              <div class="card-head-right">
+                <span v-if="p2pEffective" class="tag ok">{{ t('p2pActiveTag') }}</span>
+                <span v-else class="tag">{{ t('p2pOffTag') }}</span>
+                <button class="btn btn-ghost btn-sm" @click="refreshP2P" :disabled="p2pRefreshing">{{ t('p2pRefresh') }}</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div v-if="!p2pPaths.length" class="hint-row info">
+                <span>{{ t('p2pNoPeers') }}</span>
+              </div>
+
+              <div v-else class="p2p-paths">
+                <div v-for="pth in p2pPaths" :key="pth.peerVip" class="p2p-path-row mono">
+                  <span class="p2p-path-vip">{{ pth.peerVip }}</span>
+                  <span class="tag" :class="pth.state === 'direct' ? 'ok' : 'warn'">{{ p2pStateLabel(pth.state) }}</span>
+                  <span class="dim">{{ pth.role === 'initiator' ? t('p2pRoleInitiator') : t('p2pRoleResponder') }}</span>
+                  <span>{{ pth.rttDirectMs > 0 ? pth.rttDirectMs + ' ms' : t('p2pRttPending') }}</span>
+                  <span class="dim">↑{{ formatBytes(pth.bytesUp) }} ↓{{ formatBytes(pth.bytesDown) }}</span>
+                </div>
+                <!-- ⭐ 数据面健康告警：把「用户真没用」与「数据面坏了」区分开（review 追问 3） -->
+                <div v-for="pth in p2pPaths.filter(p => p.warn)" :key="'w-' + pth.peerVip" class="hint-row warn">
+                  <span>⚠️ {{ pth.peerVip }}：{{ pth.warn }}</span>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -440,9 +487,28 @@ export default {
       showAbout: false,
       hasPinned: false,
 
+      // ⭐ P2SP 阶段 1b-1：直连（打洞）验证面板状态
+      p2p: {
+        serverEnabled: false,
+        localEnabled: false,
+        effective: false,
+        natReady: false,
+        natType: '',
+        publicAddr: '',
+        respondedServers: 0,
+        signalStreamReady: false,
+      },
+      p2pPeerVip: '',
+      p2pPunching: false,
+      p2pRefreshing: false,
+      p2pAttemptId: '',
+      p2pStatus: null,
+      p2pPaths: [],
+
       connectedAt: null,
       nowTick: 0,
       clockTimer: null,
+      p2pPollTimer: null, // ⭐ 1b-2A：直连路径快照的定时拉取（否则字节数不会更新）
       logFilter: 'all',
       logAutoScroll: true,
 
@@ -461,6 +527,29 @@ export default {
       const c = this.activeConnection
       if (!c) return false
       return c.status === 'connecting' || c.status === 'connected'
+    },
+    isConnected() {
+      return this.activeConnection?.status === 'connected'
+    },
+    // ⭐ P2SP 阶段 1b-1：直连结果文案（原因码用后端给的中文文案，兜底显示原始码）
+    p2pResultText() {
+      const s = this.p2pStatus
+      // 已受理但还没收到任何状态事件（打洞是异步的）
+      if (!s) return this.p2pAttemptId ? this.t('p2pRunning') : this.t('p2pNoAttempt')
+      const parts = [s.state || 'unknown']
+      if (s.path) parts.push(`path=${s.path}`)
+      if (s.rttDirectMs > 0) parts.push(`RTT(direct)=${s.rttDirectMs}ms`)
+      if (s.rttQuicMs > 0) parts.push(`RTT(relay)=${s.rttQuicMs}ms`)
+      const head = parts.join(' · ')
+      if (s.state === 'direct') return head
+      const reason = s.reasonText || (s.reasonCode ? this.t('p2pReasonUnknown', { code: s.reasonCode }) : '')
+      return reason ? `${head} — ${reason}` : head
+    },
+    p2pResultClass() {
+      const st = this.p2pStatus?.state
+      if (st === 'direct') return 'ok'
+      if (st === 'failed') return 'warn'
+      return 'info'
     },
     currentLocaleShort() {
       const l = this.languages.find(x => x.code === this.currentLocale)
@@ -540,7 +629,12 @@ export default {
     obfsEnabled() { return !!this.activeConnection?.obfsEnabled },
     skipCertEnabled() { return !!this.activeConnection?.skipCertVerify },
     advancedTagCount() {
-      return (this.obfsEnabled ? 1 : 0) + (this.skipCertEnabled ? 1 : (this.hasPinned ? 1 : 0))
+      return (this.activeConnection?.p2pDisabled ? 1 : 0) +
+        (this.obfsEnabled ? 1 : 0) + (this.skipCertEnabled ? 1 : (this.hasPinned ? 1 : 0))
+    },
+    // ⭐ 1b-2A：P2P 是否真正生效（服务端开关 && 本机开关），用于卡片右上角标签
+    p2pEffective() {
+      return !!(this.p2p.effective)
     },
     primaryBtnText() {
       const s = this.activeConnection?.status
@@ -576,7 +670,19 @@ export default {
     this.activeConnectionId = this.connections[0]?.id || null
     this.checkFingerprint()
 
+    // ⭐ P2SP 阶段 1b-1：恢复上次填过的对端 VIP
+    try { this.p2pPeerVip = localStorage.getItem('hy2link_p2p_peer') || '' } catch (_) {}
+    this.refreshP2P()
+
     this.clockTimer = setInterval(() => { this.nowTick++ }, 1000)
+
+    // ⭐ 1b-2A：直连路径的字节数/状态**必须定时拉取**。
+    //    面板是拉取式的（调 P2PPaths()），而 `p2p:status` 事件只在**状态变化**时发 ——
+    //    路径稳定在 direct 之后就没有事件了，字节数会永远停在建立那一刻的 0
+    //    （真机上就是这样被发现的：流量确实走直连，面板却显示 ↑0 ↓0）。
+    this.p2pPollTimer = setInterval(() => {
+      if (this.isConnected) this.refreshP2P()
+    }, 3000)
 
     window.runtime.EventsOn('health', (snapshot) => {
       if (!snapshot) return
@@ -599,6 +705,10 @@ export default {
       this.latency = -1
       this.healthState = 'healthy'
       this.healthDetail = { lastRecvAgo: 0, lastPongAgo: 0, consecutiveFail: 0 }
+      // ⭐ P2SP 阶段 1b-1：掉线后直连状态不再可信，清空面板结果
+      this.p2pStatus = null
+      this.p2pAttemptId = ''
+      this.refreshP2P()
       this.addLog(this.t('logAutoDisconnect', { reason: reason || this.t('toastServerOffline') }))
       this.showToastMessage(reason || this.t('toastServerOffline'), 'error')
     })
@@ -625,6 +735,41 @@ export default {
       await this.consumePendingImport()
     })
 
+    // ⭐ P2SP 阶段 1b-1：直连状态事件（后端 SetP2PStatusHandler → "p2p:status"）
+    window.runtime.EventsOn('p2p:status', (st) => {
+      if (!st) return
+      this.p2pStatus = st
+      const vip = st.peerVip || '—'
+      if (st.state === 'direct') {
+        this.addLog(this.t('logP2PDirect', { vip, rtt: st.rttDirectMs || 0 }), 'success')
+      } else if (st.state === 'standby') {
+        // ⭐ 1b-2B：standby 是**设计内的正常状态**（直连还活着但更慢，流量已自动回中继），
+        // 所以只记一条 info 日志 —— 不弹错误提示（那是「失败」才该有的待遇）。
+        this.addLog(this.t('logP2PStandby', { vip }), 'info')
+      } else if (st.state === 'trial') {
+        // ⭐ 1b-4 第一步：试用期（trial）也是**正常状态** —— 打洞+握手已成功，
+        // 但数据仍走中继，等质量达标才切直连（先验后切）。同样只记 info、不弹提示。
+        this.addLog(this.t('logP2PState', { vip, state: this.t('p2pStateTrial') }), 'info')
+      } else if (st.state === 'failed') {
+        // ⭐ 1b-4 方案 A：**试用期质量不达标（quality-poor）不是用户的麻烦** ——
+        // 数据一直在中继上跑，只是这条路没能更快；用户此刻一切正常。
+        // 所以按 info 记一条、**不弹错误提示**（否则每次重试都弹一次红框 = 噪声）。
+        // ⚠️ 其余失败原因（probe-timeout / punch-timeout / nat-symmetric …）保持原样：
+        //    「哪些 reason 该弹提示」的统一 review 已记入 1b-4 远期项（含灰色地带），本次不动。
+        if (st.reasonCode === 'quality-poor') {
+          this.addLog(this.t('logP2PQualityPoor', { vip }), 'info')
+        } else {
+          const reason = st.reasonText || st.reasonCode || ''
+          this.addLog(this.t('logP2PFailed', { vip, reason }), 'warn')
+          this.showToastMessage(this.t('logP2PFailed', { vip, reason }), 'error')
+        }
+      } else {
+        // querying / discovering / intent / punching / handshaking / probing：过程状态只记日志
+        this.addLog(this.t('logP2PState', { vip, state: st.state }))
+      }
+      this.refreshP2P()
+    })
+
     setTimeout(() => { this.consumePendingImport() }, 800)
 
     window.addEventListener('keydown', this.onKeydown)
@@ -635,6 +780,7 @@ export default {
   beforeUnmount() {
     document.removeEventListener('click', this.onDocClick)
     if (this.clockTimer) clearInterval(this.clockTimer)
+    if (this.p2pPollTimer) clearInterval(this.p2pPollTimer)
     window.removeEventListener('keydown', this.onKeydown)
     window.removeEventListener('wheel', this.preventCtrlWheel)
     window.removeEventListener('keydown', this.preventZoomShortcut)
@@ -649,6 +795,15 @@ export default {
       }
     },
     // ---------- ⭐ 语言 ----------
+    // p2pStateLabel 直连路径状态的显示文案。
+    //
+    // ⭐ 1b-4 第一步：只把新增的 `trial` 本地化（「测试中」/「Testing」…）——
+    // 其余状态（direct / standby / backoff …）保持后端原样字符串，**刻意不改**，
+    // 避免顺手改动既有显示。
+    p2pStateLabel(state) {
+      if (state === 'trial') return this.t('p2pStateTrial')
+      return state
+    },
     t(key, params) {
       const dict = messages[this.currentLocale] || messages['zh-CN']
       const s = dict[key]
@@ -720,6 +875,10 @@ export default {
           skipCertVerify: !!conn.skipCertVerify,
           obfsEnabled: !!conn.obfsEnabled,
           obfsPassword: conn.obfsPassword || '',
+          // ⭐ 1b-4 第 3 步：本机「禁用 P2P」开关必须随配置导出。
+          //    缺了这一行，后端 DTO 补了字段也会恒为 false（导出文件永远显示启用）——
+          //    所以「后端 DTO + 前端导出」是这个功能的不可切片点。
+          p2pDisabled: !!conn.p2pDisabled,
         })
         if (path) {
           this.addLog(this.t('logExported', { path }))
@@ -774,6 +933,8 @@ export default {
         skipCertVerify: !!cfg.skipCertVerify,
         obfsEnabled: !!cfg.obfsEnabled,
         obfsPassword: cfg.obfsPassword || '',
+        // ⭐ 1b-2A：导入配置按「P2P 启用」处理（.hy2 里没有这个字段）
+        p2pDisabled: false,
       }
       this.connections.push(newConn)
       this.activeConnectionId = newConn.id
@@ -782,7 +943,35 @@ export default {
       this.checkFingerprint()
     },
 
+    // ---------- ⭐ 1b-2A：本机 P2P 开关 ----------
+    // 「禁用 P2P」是反义开关：勾选 = 禁用 = 传 enabled:false。
+    // ⚠️ 连接中也要立即生效（后端会清空路由表并关闭已有直连路径 → 流量回中继）。
+    async onP2PDisabledChange() {
+      const conn = this.activeConnection
+      if (!conn) return
+      this.saveConnections()
+      if (!this.isConnected) return // 未连接：只记配置，下次连接生效
+      try {
+        await window.go.main.App.SetP2PLocal(!conn.p2pDisabled)
+        this.addLog(conn.p2pDisabled
+          ? this.t('logP2PLocalDisabled')
+          : this.t('logP2PLocalEnabled'))
+      } catch (e) {
+        this.showToastMessage(this.t('toastSaveFailed', { err: e.message }), 'error')
+      }
+      this.refreshP2P()
+    },
+
     // ---------- 原有方法 ----------
+    // ⭐ 1b-2A：直连路径字节数显示（B/KB/MB/GB）
+    formatBytes(n) {
+      const v = Number(n) || 0
+      if (v < 1024) return v + ' B'
+      if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB'
+      if (v < 1024 * 1024 * 1024) return (v / (1024 * 1024)).toFixed(1) + ' MB'
+      return (v / (1024 * 1024 * 1024)).toFixed(2) + ' GB'
+    },
+
     fmtDuration(sec) {
       sec = Math.max(0, Math.floor(sec))
       const h = Math.floor(sec / 3600)
@@ -986,6 +1175,8 @@ export default {
           skipCertVerify: !!conn.skipCertVerify,
           obfsEnabled: !!conn.obfsEnabled,
           obfsPassword: conn.obfsPassword || '',
+          // ⭐ 1b-2A：本机「禁用 P2P」开关（配置里就是禁用语义，后端取反）
+          p2pDisabled: !!conn.p2pDisabled,
         })
         conn.status = 'connected'
         this.virtualIP = ip
@@ -993,6 +1184,11 @@ export default {
         this.addLog(this.t('logConnectSuccess', { ip }))
         this.showToastMessage(this.t('toastConnectSuccess'), 'success')
         this.checkFingerprint()
+        // ⭐ P2SP 阶段 1b-1：NAT 探测是异步的，隔几秒自动刷新几次验证面板
+        this.refreshP2P()
+        ;[1000, 3000, 6000, 10000].forEach(ms => setTimeout(() => {
+          if (this.isConnected) this.refreshP2P()
+        }, ms))
       } catch (e) {
         conn.status = 'error'
         this.addLog(this.t('logConnectFailed', { err: e.message }))
@@ -1016,6 +1212,10 @@ export default {
         this.connectedAt = null
         this.latency = -1
         this.healthState = 'healthy'
+        // ⭐ P2SP 阶段 1b-1：断开后验证面板回到空态
+        this.p2pStatus = null
+        this.p2pAttemptId = ''
+        this.refreshP2P()
         this.addLog(this.t('logDisconnected'))
         this.showToastMessage(this.t('toastDisconnected'), 'success')
       } catch (e) {
@@ -1056,8 +1256,64 @@ export default {
       }
     },
 
-    addLog(msg) {
-      this.logs.push({ time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), text: msg })
+    // ---------- ⭐ P2SP 阶段 1b-1：直连（打洞）验证 ----------
+    async refreshP2P() {
+      if (!window.go?.main?.App?.SignalSelf) return
+      this.p2pRefreshing = true
+      try {
+        const s = await window.go.main.App.SignalSelf()
+        if (!s || s.connected === false) {
+          this.p2p = {
+            serverEnabled: false, localEnabled: false, effective: false, natReady: false,
+            natType: '', publicAddr: '', respondedServers: 0, signalStreamReady: false,
+          }
+          return
+        }
+        this.p2p = {
+          serverEnabled: !!s.p2pServerEnabled,
+          localEnabled: !!s.p2pLocalEnabled,
+          effective: !!s.p2pEffective,
+          natReady: !!s.natReady,
+          natType: s.natType || '',
+          publicAddr: s.publicAddr || '',
+          respondedServers: s.respondedServers || 0,
+          signalStreamReady: !!s.signalStreamReady,
+        }
+        // ⭐ 1b-2A：直连对端列表（流量驱动建立，UI 只展示）
+        if (window.go?.main?.App?.P2PPaths) {
+          try { this.p2pPaths = (await window.go.main.App.P2PPaths()) || [] } catch (_) {}
+        }
+      } catch (_) {
+        // 未连接 / 客户端已销毁：面板只是诊断用，静默即可
+      } finally {
+        this.p2pRefreshing = false
+      }
+    },
+
+    async doPunch() {
+      const vip = (this.p2pPeerVip || '').trim()
+      if (!vip) { this.showToastMessage(this.t('p2pNeedPeerVip'), 'error'); return }
+      if (!window.go?.main?.App?.PunchTo) return
+      this.p2pPunching = true
+      this.p2pStatus = null
+      this.p2pAttemptId = ''
+      try {
+        const id = await window.go.main.App.PunchTo(vip)
+        this.p2pAttemptId = id || ''
+        try { localStorage.setItem('hy2link_p2p_peer', vip) } catch (_) {}
+        this.addLog(this.t('logP2PPunchStart', { vip, id: id || '-' }))
+        this.showToastMessage(this.t('p2pPunchStarted'), 'success')
+      } catch (e) {
+        this.addLog(this.t('logP2PPunchFailed', { err: e.message }), 'warn')
+        this.showToastMessage(this.t('p2pPunchFailed', { err: e.message }), 'error')
+      } finally {
+        this.p2pPunching = false
+        this.refreshP2P()
+      }
+    },
+
+    addLog(msg, cls) {
+      this.logs.push({ time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), text: msg, cls: cls || undefined })
       if (this.logAutoScroll) {
         this.$nextTick(() => {
           const c = this.$refs.logContainer
@@ -1069,6 +1325,8 @@ export default {
     clearLogs() { this.logs = [] },
 
     getLogClass(msg) {
+      // ⭐ 直连事件自带分类（避免靠文案猜：直连成功/失败的中文里没有「成功/失败」字样）
+      if (msg?.cls) return msg.cls
       const t = msg?.text || ''
       if (/失败|错误|error|failed/i.test(t)) return 'error'
       if (/警告|warn|⚠/i.test(t)) return 'warn'
@@ -1096,6 +1354,8 @@ export default {
             if (typeof c.skipCertVerify !== 'boolean') c.skipCertVerify = false
             if (typeof c.obfsEnabled !== 'boolean') c.obfsEnabled = false
             if (typeof c.obfsPassword !== 'string') c.obfsPassword = ''
+            // ⭐ 1b-2A：老连接没有「禁用 P2P」字段 → 默认 false（= P2P 启用，与升级前行为一致）
+            if (typeof c.p2pDisabled !== 'boolean') c.p2pDisabled = false
             // ⭐ 老版本存下的连接没有「用户名 / 连接名称」字段，补默认值
             if (typeof c.username !== 'string') c.username = ''
             if (typeof c.name !== 'string') c.name = ''
@@ -1958,6 +2218,12 @@ textarea {
   border: 1px solid rgba(59, 130, 246, 0.18);
   color: #60a5fa;
 }
+/* ⭐ 数据面健康告警（review 追问 3）：黄色，与「说明」和「错误」都区分开 */
+.hint-row.warn {
+  background: rgba(234, 179, 8, 0.08);
+  border: 1px solid rgba(234, 179, 8, 0.22);
+  color: #eab308;
+}
 .link {
   background: transparent;
   border: none;
@@ -2239,6 +2505,46 @@ textarea {
 }
 .modal-enter-active, .modal-leave-active { transition: opacity 0.2s; }
 .modal-enter-from, .modal-leave-to { opacity: 0; }
+
+/* P2SP 阶段 1b-1：直连（打洞）验证面板 */
+.p2p-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px 14px;
+  margin-bottom: 14px;
+}
+.p2p-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.p2p-cell .stat-value { overflow-wrap: anywhere; }
+/* ⭐ 1b-2A：直连对端列表 */
+.p2p-paths { margin: 4px 0 10px; }
+.p2p-paths-head {
+  font-size: 11px;
+  color: var(--text-3);
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+.p2p-path-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+  font-size: 11.5px;
+  border-top: 1px solid var(--border);
+}
+.p2p-path-vip { min-width: 110px; }
+.p2p-action {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.p2p-action .field { flex: 1 1 220px; }
 
 /* Animations */
 @keyframes pulse {

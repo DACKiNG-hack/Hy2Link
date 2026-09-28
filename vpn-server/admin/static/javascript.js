@@ -716,6 +716,17 @@ const app = createApp({
             try { await api('/api/users/' + encodeURIComponent(u.username), { method: 'DELETE' }); await loadUsers(); }
             catch (e) { alert(t('users.deleteFail') + '：' + e.message); }
         }
+        // ⭐ P3：重置某账号的累计用量。
+        //    UsedBytes 是持久化的、且**没有自动归零**（不是按自然月、也不是按连接周期），
+        //    而认证与运行期配额复查都以「已用 >= 配额」判用尽 —— 没有这个入口，
+        //    配额用尽的用户就永久连不上（踢人没有恢复路径）。
+        async function resetTraffic(u) {
+            if (!confirm(t('users.resetConfirm', { name: u.username }))) return;
+            try {
+                await api('/api/users/reset-traffic?username=' + encodeURIComponent(u.username), { method: 'POST' });
+                await loadUsers();
+            } catch (e) { alert(t('users.resetTrafficFail') + '：' + e.message); }
+        }
         // ⭐ 一个账号可以被多个客户端共用，因此按 VIP 精确踢出单个连接；
         //    vip 为空时退回「踢掉该账号的全部连接」。
         async function kick(username, vip) {
@@ -849,7 +860,7 @@ const app = createApp({
             loadCertStatus, loadCertConfig, saveCertConfig, regenerateCert, copyFingerprint,
             onlineChart, trafficChart,
             login, logout, startServer, stopServer, restartServer, saveConfig, resetConfig, syncCfg,
-            openCreateUser, openEditUser, saveUser, deleteUser, kick, changePassword,
+            openCreateUser, openEditUser, saveUser, deleteUser, resetTraffic, kick, changePassword,
             loadGeo, saveGeo,
             loadPerformance, savePerformance,
             loadMetrics,

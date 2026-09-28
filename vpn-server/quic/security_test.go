@@ -283,8 +283,9 @@ func TestKickAllSharedAccount(t *testing.T) {
 	}
 
 	// 连接真正断开后（handler 的 defer 会调用 unregisterData）才彻底下线
-	s.unregisterData([4]byte{10, 0, 0, 11}, csA)
-	s.unregisterData([4]byte{10, 0, 0, 12}, csB)
+	// ⚠️ 修法 1：第二个参数是"**本连接自己的 conn**"（身份判据），不再是 `cs`
+	s.unregisterData([4]byte{10, 0, 0, 11}, csA.getDataConn())
+	s.unregisterData([4]byte{10, 0, 0, 12}, csB.getDataConn())
 	if got := s.kickAll("shared"); got != 0 {
 		t.Fatalf("下线后应踢 0 个，实际 %d", got)
 	}

@@ -81,6 +81,10 @@ type Manager struct {
 
 	certMgr *cert.Manager
 
+	// ⭐ P2SP 阶段 1：信令登记表（进程级，跨 Start/Stop 复用，
+	//    避免每次重启都新起一个清理 goroutine）
+	signalReg *admin.SignalRegistry
+
 	udpConn   *net.UDPConn
 	obfsConn  net.PacketConn // ⭐ 混淆包装后的 PacketConn（底层是 udpConn）
 	transport *quicgo.Transport
@@ -91,6 +95,13 @@ type Manager struct {
 	ipAllocator *quic.IPAllocator
 
 	serverTun *tun.TUNDevice
+	// ⭐ P2SP 阶段 1b-1 补丁：内置 STUN 端点（独立 UDP socket；P2P 关闭时恒为 nil）
+	builtinSTUN *quic.BuiltinSTUN
+
+	// ⭐ P3 补丁：中继配额的运行期复查（见 quota.go）
+	quotaStop     chan struct{}
+	quotaDone     chan struct{}
+	quotaInterval time.Duration // 0 = 用 defaultQuotaCheckInterval（测试可改小）
 }
 
 func New(cfg *config.ServerConfig, cfgPath string, userStore *store.Store, adminState *admin.AdminState, certMgr *cert.Manager) *Manager {
@@ -100,6 +111,8 @@ func New(cfg *config.ServerConfig, cfgPath string, userStore *store.Store, admin
 		userStore:  userStore,
 		adminState: adminState,
 		certMgr:    certMgr,
+		// ⭐ P2SP 阶段 1：信令登记表（TTL 5 分钟 + 后台清理）
+		signalReg: admin.NewSignalRegistry(admin.SignalEntryTTL),
 	}
 }
 
@@ -126,6 +139,13 @@ func (m *Manager) Status() config.ServerStatus {
 	if m.running {
 		status.Uptime = time.Since(m.startedAt).Seconds()
 	}
+	// ⭐ P2SP 阶段 1b-1 补丁：内置 STUN 的实际状态。
+	//    面板必须能看到「仅启动 1/2」——只绑一个端点时国内打洞无法开始，
+	//    只在日志里写一行 port occupied 是不够的。
+	if m.builtinSTUN != nil {
+		status.BuiltinSTUNPorts = m.builtinSTUN.Ports()
+	}
+	status.BuiltinSTUNWarning = m.builtinSTUN.Warning(m.cfg.P2PEnabled, m.cfg.STUNPort)
 	return status
 }
 
@@ -313,9 +333,22 @@ func (m *Manager) Start() error {
 
 	auth := quic.NewCustomAuthenticatorWithAllocator(m.userStore, ipAllocator, cfg.MinClientVersion, cfg.MaxClientVersion)
 
+	// ⭐ P2SP 阶段 1b-1 补丁：服务端内置 STUN 端点（独立 UDP socket，不碰 QUIC 监听路径）。
+	//    只在 P2P 开启且端口非 0 时启动；实际生效的端口会写进 DHCP 第 12 段
+	//    （announce 反映**现实**：端口没开就不公告，免得客户端白等 3 秒）。
+	var builtinSTUN *quic.BuiltinSTUN
+	if quic.ShouldStartBuiltinSTUN(cfg.P2PEnabled, cfg.STUNPort) {
+		builtinSTUN = quic.StartBuiltinSTUN(cfg.STUNPort)
+	} else {
+		log.Printf("📡 [内置STUN] 未启动（P2P=%v, stunPort=%d）", cfg.P2PEnabled, cfg.STUNPort)
+	}
+
 	// ⭐ 用 certMgr 拿实际证书（hyCfg 需要 tls.Certificate）
 	cert, err := m.certMgr.Load()
 	if err != nil {
+		if builtinSTUN != nil {
+			builtinSTUN.Close()
+		}
 		listener.Close()
 		transport.Close()
 		udpConn.Close()
@@ -341,6 +374,8 @@ func (m *Manager) Start() error {
 			cfg.UDPReliableEnabled, cfg.UDPReliablePorts,
 			cfg.UDPUnreliableEnabled, cfg.UDPUnreliablePorts,
 			string(m.certMgr.Mode()), m.certMgr.ServerHostname(),
+			cfg.P2PEnabled,         // ⭐ P2SP 阶段 0：作为 DHCP 应答的第 11 段下发
+			builtinSTUN.Announce(), // ⭐ P2SP 阶段 1b-1 补丁：第 12 段（"3478|3479" 或 "off"）
 		),
 		BandwidthConfig: server.BandwidthConfig{},
 		CongestionConfig: server.CongestionConfig{
@@ -350,6 +385,9 @@ func (m *Manager) Start() error {
 	}
 	hysteriaSrv, err := server.NewServer(hyCfg)
 	if err != nil {
+		if builtinSTUN != nil {
+			builtinSTUN.Close()
+		}
 		listener.Close()
 		transport.Close()
 		udpConn.Close()
@@ -407,6 +445,8 @@ func (m *Manager) Start() error {
 		udpReliablePorts,
 		udpUnreliablePorts,
 	)
+	// ⭐ P2SP 阶段 1：隧道内信令（必须在 accept 循环启动前设置）
+	dataServer.EnableP2PSignal(cfg.P2PEnabled, m.signalReg)
 
 	if serverTun != nil {
 		go dataServer.ServerTunReadLoop()
@@ -451,12 +491,23 @@ func (m *Manager) Start() error {
 	m.dataServer = dataServer
 	m.ipAllocator = ipAllocator
 	m.serverTun = serverTun
+	m.builtinSTUN = builtinSTUN
 	m.mu.Unlock()
+
+	// ⭐ P3 补丁：启动「中继配额运行期复查」（原来配额只在认证时检查一次，
+	//    会话建立后可以无限超用；见 quota.go 的说明）
+	m.startQuotaWatchdog()
 
 	return nil
 }
 
 func (m *Manager) Stop() error {
+	// ⭐ P3 补丁：**先**停掉配额复查，避免它在本函数清空 dataServer 之后再调用 Kick
+	//    （也避免「停止过程中还在踢人」）。
+	//    ⚠️ 必须放在加锁之前：stopQuotaWatchdog 内部要等复查 goroutine 退出，
+	//    而那个 goroutine 会经 m.Kick 去拿 m.mu.RLock。
+	m.stopQuotaWatchdog()
+
 	m.mu.Lock()
 	if !m.running {
 		m.mu.Unlock()
@@ -470,6 +521,7 @@ func (m *Manager) Stop() error {
 	hysteriaSrv := m.hysteriaSrv
 	dataServer := m.dataServer
 	serverTun := m.serverTun
+	builtinSTUN := m.builtinSTUN
 
 	m.listener = nil
 	m.transport = nil
@@ -478,9 +530,15 @@ func (m *Manager) Stop() error {
 	m.hysteriaSrv = nil
 	m.dataServer = nil
 	m.serverTun = nil
+	m.builtinSTUN = nil
 	m.mu.Unlock()
 
 	log.Printf("🛑 正在停止服务端...")
+
+	// ⭐ 先关内置 STUN 端点（独立 socket，与 QUIC 无关）
+	if builtinSTUN != nil {
+		builtinSTUN.Close()
+	}
 
 	if listener != nil {
 		_ = listener.Close()

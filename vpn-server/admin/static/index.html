@@ -223,6 +223,12 @@
                                 {{ busy ? $t('server.busy') : (server.lastError ? $t('server.error') + ': ' + server.lastError : '') }}
                             </span>
                         </div>
+                        <!-- P2SP 内置 STUN 端点状态：文案由后端给出（含「仅启动 1/2，P2P 直连可能不可用」） -->
+                        <div class="card-body" v-if="server.config && server.config.p2pEnabled">
+                            <span class="inline-hint" :class="{ err: server.builtinStunWarning }">
+                                {{ server.builtinStunWarning || ('HARP 直连 STUN 端点：' + ((server.builtinStunPorts && server.builtinStunPorts.length) || 0) + '/2' + (server.builtinStunPorts && server.builtinStunPorts.length ? '（端口 ' + server.builtinStunPorts.join('、') + '）' : '')) }}
+                            </span>
+                        </div>
                     </div>
 
                     <div class="card">
@@ -403,6 +409,21 @@
                                     <input type="text" v-model.lazy="cfg.serverTunMask" :disabled="server.running" :placeholder="$t('config.serverTunMaskPlaceholder')" />
                                 </div>
                             </div>
+
+                            <div class="divider"></div>
+
+                            <!-- ⭐ P2SP 阶段 0：P2P 直连开关（默认关闭） -->
+                            <div class="switch-row">
+                                <div class="switch-info">
+                                    <div class="switch-name">{{ $t('config.p2p') }}</div>
+                                    <div class="switch-desc">{{ $t('config.p2pDesc') }}</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" v-model="cfg.p2pEnabled" :disabled="server.running" />
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <p class="field-hint">{{ $t('config.p2pHint') }}</p>
 
                             <div class="actions-footer">
                                 <button class="btn btn-primary" @click="saveConfig" :disabled="server.running || busy">{{ $t('config.saveBtn') }}</button>
@@ -623,6 +644,7 @@
                                     <td class="muted mono">{{ u.expireAt && u.expireAt !== '0001-01-01T00:00:00Z' ? formatDate(u.expireAt) : '—' }}</td>
                                     <td class="muted">{{ u.note || '—' }}</td>
                                     <td class="col-actions">
+                                        <button class="btn btn-ghost btn-xs" @click="resetTraffic(u)">{{ $t('users.resetTraffic') }}</button>
                                         <button class="btn btn-ghost btn-xs" @click="openEditUser(u)">{{ $t('users.edit') }}</button>
                                         <button class="btn btn-danger btn-xs" @click="deleteUser(u)">{{ $t('users.delete') }}</button>
                                     </td>

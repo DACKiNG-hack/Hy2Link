@@ -44,6 +44,27 @@ type ServerConfig struct {
 	// ⭐ 新增：Salamander 混淆
 	ObfsEnabled  bool   `json:"obfsEnabled"`
 	ObfsPassword string `json:"obfsPassword"`
+
+	// ⭐ 新增（P2SP 阶段 0）：P2P 直连开关。
+	//
+	// 默认关闭。关闭时：
+	//   - DHCP 应答里第 11 段 p2p 为 "off"，客户端不会做 NAT 探测、不发信令；
+	//   - /api/signal/exchange 直接返回 403。
+	// 即：关闭时行为与引入这个功能之前**完全一致**。
+	P2PEnabled bool `json:"p2pEnabled"`
+
+	// ⭐ 新增（P2SP 阶段 1b-1 补丁）：服务端内置 STUN 端点的基础 UDP 端口。
+	//
+	// 为什么需要：国内公共 STUN 经常不可达 → 客户端拿不到自己的公网映射 →
+	// 打洞根本不开始。内置端点让客户端有一个**必然可达**的观测点。
+	//
+	//   - 默认 3478；服务端会占用 `stunPort` 与 `stunPort+1` **两个** UDP 端口
+	//     （两个是必须的：客户端需要至少两台响应者才能判定「映射是否与目的地址无关」，
+	//      只有一台会被判成 NATUnknown，打洞照样不会开始）；
+	//   - **0 表示显式关闭**；`P2PEnabled=false` 时也不会启动；
+	//   - 与 QUIC 监听端口完全独立，不影响 6 条连接架构与混淆包装；
+	//   - 部署时需要在防火墙放行这两个 UDP 端口。
+	STUNPort int `json:"stunPort"`
 }
 
 type ServerStatus struct {
@@ -53,6 +74,14 @@ type ServerStatus struct {
 	LastError string        `json:"lastError"`
 	Port      int           `json:"port"`
 	Config    *ServerConfig `json:"config"`
+
+	// ⭐ P2SP 阶段 1b-1 补丁：内置 STUN 端点的实际状态（面板要能看见）
+	//
+	//   - BuiltinSTUNPorts：实际生效的端口（正常 2 个，为空表示没启动）
+	//   - BuiltinSTUNWarning：非空 = 需要管理员处理。**只起来 1 个端点时必须出现在面板上**，
+	//     因为「只绑一个」= 客户端判不出映射是否与目标端口有关 = 国内打洞无法开始。
+	BuiltinSTUNPorts   []int  `json:"builtinStunPorts,omitempty"`
+	BuiltinSTUNWarning string `json:"builtinStunWarning,omitempty"`
 }
 
 func DefaultConfig() *ServerConfig {
@@ -92,8 +121,27 @@ func DefaultConfig() *ServerConfig {
 		// ⭐ 新增：默认不启用混淆
 		ObfsEnabled:  false,
 		ObfsPassword: "",
+
+		// ⭐ 2026-09-28（切片「服务端默认启用 HARP 直连」· 方案 A）：**新部署默认开启**。
+		//
+		//	⚠️ 只影响**新部署**：`Load()` 是 `cfg := DefaultConfig()` → `json.Unmarshal(data, cfg)`
+		//	⇒ 文件里**显式**的键覆盖默认；而 `Save()` 无 `omitempty` ⇒ 旧部署的磁盘上必然写着
+		//	`"p2pEnabled": false`（旧默认值填的，非用户显式选择）⇒ **已部署保持原样**（方案 A 的定义）。
+		//	守卫：`TestDefaultConfigP2PEnabledByDefault`（新部署 on）
+		//	      + `TestExplicitP2PFalseIsPreserved`（显式 false 仍生效 ⇒ 已部署不改）
+		//	      + `TestDefaultConfigStringShowsP2POn`（String() 含 p2p=on）。
+		P2PEnabled: true,
+
+		// ⭐ 新增（P2SP 阶段 1b-1 补丁）：内置 STUN 基础端口（占用 3478 与 3479）
+		STUNPort: defaultSTUNPort,
 	}
 }
+
+// defaultSTUNPort 内置 STUN 的默认基础端口。
+//
+// 用 3478（STUN 的标准端口）而不是从其他端口推导：可预测、便于写进防火墙规则；
+// 若被占用，服务端会在 `stunPort+1` 单独起来并如实只公告那一个（admin 可在日志里看到告警）。
+const defaultSTUNPort = 3478
 
 func Load(path string) (*ServerConfig, error) {
 	cfg := DefaultConfig()
@@ -371,7 +419,13 @@ func (c *ServerConfig) String() string {
 		obfsTag = fmt.Sprintf("on(pskLen=%d)", len(c.ObfsPassword))
 	}
 
-	return fmt.Sprintf("port=%d portVPN=%d pool=%s-%s stream=%d conn=%d tcpSplit=%s udpReliable=%s udpUnreliable=%s obfs=%s clientVer=%s%s",
+	// ⭐ 新增（P2SP 阶段 0）
+	p2pTag := "off"
+	if c.P2PEnabled {
+		p2pTag = "on"
+	}
+
+	return fmt.Sprintf("port=%d portVPN=%d pool=%s-%s stream=%d conn=%d tcpSplit=%s udpReliable=%s udpUnreliable=%s obfs=%s p2p=%s clientVer=%s%s",
 		c.Port, c.PortVPN, c.IPPoolStart, c.IPPoolEnd,
-		c.StreamWindow, c.ConnWindow, tcpSplit, udpRel, udpUnrel, obfsTag, verRange, extra)
+		c.StreamWindow, c.ConnWindow, tcpSplit, udpRel, udpUnrel, obfsTag, p2pTag, verRange, extra)
 }

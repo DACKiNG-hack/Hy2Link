@@ -11,9 +11,24 @@ import (
 )
 
 const (
-	initialCwndPackets  = 10
-	minCwndPackets      = 4
-	lossReductionFactor = 0.85
+	initialCwndPackets = 10
+	minCwndPackets     = 4
+
+	// lossReductionFactor 丢包时的乘性回退系数（β）。
+	//
+	// ⭐ 取值 0.7，与同目录其它控制器一致：
+	//   - cubic.go:        beta        = 0.7
+	//   - cubic_sender.go: renoBeta    = 0.7
+	//
+	// 这里曾被写成 0.85（那是 CUBIC 的 **betaLastMax**，不是回退系数），
+	// 导致 TestQUICDC_LossReduction 一直失败（断言 0.7、实现 0.85）。
+	// 该目录是从 quic-go 拷来的，两处不同步属于历史遗留；
+	// 0.85 没有任何调参记录/注释支持，按同目录约定回到 0.7。
+	// 要改这个值，请连同 TestQUICDC_LossReduction 的期望一起改。
+	//
+	// 如果将来（实测/线上表现）发现 0.85 在某些场景是必要的值，
+	// 请重新评估并连同测试一起改 —— 不要只改常量。
+	lossReductionFactor = 0.7
 )
 
 // QUICDCController 基于 OWQD 感知的 QUIC 拥塞控制器

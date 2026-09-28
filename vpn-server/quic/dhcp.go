@@ -28,6 +28,13 @@ type DHCPOutbound struct {
 	// ⭐ 新增
 	certMode       string
 	serverHostname string
+
+	// ⭐ 新增（P2SP 阶段 0）：P2P 开关，作为应答的第 11 段下发
+	p2pEnabled bool
+
+	// ⭐ 新增（P2SP 阶段 1b-1 补丁）：服务端内置 STUN 端点，作为第 12 段下发
+	//    （形如 "3478|3479"；没有就是 "off"）
+	builtinSTUN string
 }
 
 func NewDHCPOutbound(
@@ -40,6 +47,8 @@ func NewDHCPOutbound(
 	udpUnreliablePorts []string,
 	certMode string, // ⭐ 新增
 	serverHostname string, // ⭐ 新增
+	p2pEnabled bool, // ⭐ 新增（P2SP 阶段 0）
+	builtinSTUN string, // ⭐ 新增（P2SP 阶段 1b-1 补丁）：内置 STUN 端口列表
 ) *DHCPOutbound {
 	return &DHCPOutbound{
 		ipAllocator:          ipAllocator,
@@ -51,6 +60,8 @@ func NewDHCPOutbound(
 		udpUnreliablePorts:   udpUnreliablePorts,
 		certMode:             certMode,
 		serverHostname:       serverHostname,
+		p2pEnabled:           p2pEnabled,
+		builtinSTUN:          builtinSTUN,
 	}
 }
 
@@ -138,11 +149,28 @@ func (c *dhcpConn) Read(b []byte) (n int, err error) {
 		}
 	}
 
-	// ⭐ 10 段：
-	// ip,mask,tcpSplit,tcpPorts,udpRel,udpRelRanges,udpUnrel,udpUnrelRanges,certMode,serverHostname
+	// ⭐ P2SP 阶段 0：第 11 段 P2P 开关。
+	//    旧客户端只解析到第 10 段（`len(parts) >= N` 逐段判断），
+	//    多出来的这一段会被安全忽略 → 向后兼容。
+	p2p := "off"
+	if o.p2pEnabled {
+		p2p = "on"
+	}
+
+	// ⭐ P2SP 阶段 1b-1 补丁：第 12 段 = 服务端内置 STUN 端点（端口列表，"off" 表示没有）。
+	//    只发端口不发 IP：客户端已经知道自己在连哪个服务器地址（`serverIP`），
+	//    拼起来就是它可达的 STUN 地址 —— 这样主机名/多地址部署都不用额外配置。
+	//    同样向后兼容：旧客户端不读第 12 段。
+	stun := o.builtinSTUN
+	if stun == "" {
+		stun = "off"
+	}
+
+	// ⭐ 12 段：
+	// ip,mask,tcpSplit,tcpPorts,udpRel,udpRelRanges,udpUnrel,udpUnrelRanges,certMode,serverHostname,p2p,stun
 	response := c.ip + "," + c.mask + "," + tcpSplit + "," + tcpPortsStr +
 		"," + udpRel + "," + udpRelStr + "," + udpUnrel + "," + udpUnrelStr +
-		"," + o.certMode + "," + o.serverHostname + "\n"
+		"," + o.certMode + "," + o.serverHostname + "," + p2p + "," + stun + "\n"
 
 	n = copy(b, []byte(response))
 	c.responded = true

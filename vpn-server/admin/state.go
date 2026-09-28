@@ -25,6 +25,16 @@ type AdminState struct {
 	clients   map[string]*ClientInfo
 	totalIn   uint64
 	totalOut  uint64
+
+	// trafficMisses 「每客户端」计数因 key 不存在而被丢弃的**次数**（只增，可查询）。
+	//
+	// ⚠️ 为什么需要它（2026-09-28 面板趋势图 bug）：`AddTraffic` 查不到 key 时**静默丢弃**，
+	//	而趋势图读的正是「Σ 每客户端字节」⇒ 一旦该 VIP 不在表里，趋势图恒 0 而
+	//	`totalIn/totalOut`（无条件累加）仍在涨 ⇒ 现象难以归因、潜伏多年。
+	//	本条即《工程纪律》**§3 第 17 条**（"不可见分支"必须可见化）的落地：
+	//	**正常不该发生**的分支 ⇒ 至少"可查询计数器"（并配限频日志）。
+	//	判据：该值长期为 0 才是正常；非 0 ⇒ 有客户端在"未登记"状态下产生了流量。
+	trafficMisses uint64
 }
 
 func NewAdminState(version string) *AdminState {
@@ -44,14 +54,41 @@ func (s *AdminState) OnConnect(key, username, mode, vip, realAddr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	s.clients[key] = &ClientInfo{
-		Username:  username,
-		Mode:      mode,
-		VirtualIP: vip,
-		RealAddr:  realAddr,
-		Connected: now,
-		LastSeen:  now,
-		LatencyMs: 0,
+	old, exists := s.clients[key]
+	if !exists {
+		s.clients[key] = &ClientInfo{
+			Username:  username,
+			Mode:      mode,
+			VirtualIP: vip,
+			RealAddr:  realAddr,
+			Connected: now,
+			LastSeen:  now,
+			LatencyMs: 0,
+		}
+		return
+	}
+
+	// ⭐ 2026-09-28（面板趋势图 bug · 修法 2）：**upsert 语义** —— 同一 key 再次登记（接管/重连）时
+	//	**不得无条件重建** `ClientInfo`，否则 `BytesIn/BytesOut` 归零 ⇒ 面板数字倒退，
+	//	且（见下）会让"趋势图读 Σ 每客户端"这种口径更加脆弱。
+	//
+	//	语义定稿：
+	//	 · **同一身份**（`Username` 相同）⇒ 视为**同一条在线会话**：**保留计数**、刷新元数据与 `LastSeen`、
+	//	   **不刷新 `Connected`**（它表示"首次上线时刻"，接管不算新会话）。
+	//	 · **身份变了**（`Username` 不同 ⇒ 该 VIP 已被回收给别的设备）⇒ **视为新会话**：
+	//	   计数归零、`Connected` 重置。它同时是"修法 1（陈旧收尾不得删条目）"的**兜底**：
+	//	   即便上层漏了身份判定，这里也不会把两个客户端的数据混在一起。
+	sameIdentity := old.Username == username
+	old.Mode = mode
+	old.VirtualIP = vip
+	old.RealAddr = realAddr
+	old.LastSeen = now
+	if !sameIdentity {
+		old.Username = username
+		old.BytesIn = 0
+		old.BytesOut = 0
+		old.LatencyMs = 0
+		old.Connected = now
 	}
 }
 
@@ -80,9 +117,23 @@ func (s *AdminState) AddTraffic(key string, in, out uint64) {
 		c.BytesIn += in
 		c.BytesOut += out
 		c.LastSeen = time.Now()
+	} else {
+		// ⚠️ 正常**不该**发生（数据面建立时必 `OnConnect`）⇒ 计入可查询计数（§3 第 17 条）。
+		//	静默丢弃 = 趋势图恒 0 而无人知晓（2026-09-28 的面板 bug 正是此形态）。
+		s.trafficMisses++
 	}
 	s.totalIn += in
 	s.totalOut += out
+}
+
+// TrafficMisses 返回「每客户端计数被丢弃」的累计次数（= 未知 key 的 AddTraffic 次数）。
+//
+// 排障用法：**长期应为 0**；非 0 ⇒ 有客户端在"未登记"状态下产生了流量
+// （典型成因：接管/重连路径未维护在线状态，见 `admin_state_reconnect_test.go` 的说明）。
+func (s *AdminState) TrafficMisses() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.trafficMisses
 }
 
 type Snapshot struct {

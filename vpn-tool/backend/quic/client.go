@@ -40,7 +40,7 @@ const (
 	alpnCtrl = "h3-ctrl"
 )
 
-const ClientVersion = "1.1.0"
+const ClientVersion = "1.2.0"
 const hardcodedBBRProfile = "ultra"
 const hardcodedLatencyMode = "low"
 
@@ -214,6 +214,21 @@ func isKickedError(err error) (bool, string) {
 
 func isDebugMode() bool {
 	return strings.ToLower(os.Getenv("HY_DEBUG")) == "true"
+}
+
+// probeTraceEnabled 直连**探针收发**的可观测开关（2026-09-27 真机 bug 的排查口）。
+//
+// ⚠️ 为什么单独给一个开关（而不复用 isDebugMode）：`HY_DEBUG=true` 会打开大量日志，
+// 排查「试用期采不到样本」时噪声太大；本开关只开**探针级**那几行。
+//
+// 用法（真机：把环境变量设在客户端进程上即可，**不用改代码**）：
+//
+//	Windows PowerShell:  $env:HY2_PROBE_TRACE='true'; .\vpn-tool.exe ...
+//	Linux/macOS:         HY2_PROBE_TRACE=true ./vpn-tool ...
+//
+// ⚠️ 它会每 `probeInterval`（5s）每条路径打一行 —— **只在排查时开**。
+func probeTraceEnabled() bool {
+	return strings.ToLower(os.Getenv("HY2_PROBE_TRACE")) == "true" || isDebugMode()
 }
 
 func isQUICDCDebug() bool {
@@ -488,6 +503,51 @@ type Hysteria2Client struct {
 	ctrlCtx    context.Context
 	ctrlCancel context.CancelFunc
 
+	// ⭐ P2SP 阶段 1：隧道内信令流（h3-ctrl 上的第 4 条 stream）
+	//
+	// 通道形态是「**常驻读协程** + 写请求等响应」，不是「发一问读一答」：
+	// 打洞要求双方同时发包，服务端必须能把「A 想连你」主动推给 B，
+	// 而 B 不读流就永远收不到（详见 signal.go 顶部）。
+	signalMu        sync.Mutex         // 保护下面 5 个字段
+	signalStream    *quic.Stream       // 当前信令流（nil = 没有）
+	signalGen       chan struct{}      // 当前流的代际：流结束时 close，唤醒所有等待者
+	signalPending   chan signalMessage // 当前等待应答的槽位（nil = 无人等待）
+	signalDeadUntil time.Time          // 流被对端断开后的重开冷却截止
+	signalPush      func(SignalPush)   // 服务端主动下行的处理钩子（1b）
+	signalOpenMu    sync.Mutex         // 串行化「打开流」，避免并发开出两条
+	signalReqMu     sync.Mutex         // 串行化「请求—响应」往返（协议无请求 ID）
+	signalWriteMu   sync.Mutex         // 串行化写入（预留多写者，见 signal.go）
+	signalReaders   int32              // 活跃读协程数（atomic，诊断/测试用）
+
+	// ⭐ D1-a：「服务端不支持 peers」的**单次探测缓存**（atomic）。
+	//
+	// 语义（方案 §7）：新客户端 + **旧服务端** ⇒ 回 `unknown message type`；
+	// 把该结论缓存起来，**本次连接内只探测一次**（否则每次预打洞都去打一个不支持的服务端）。
+	// ⚠️ **超时不缓存**（超时可能是「服务端忙/网络慢」被误判成「不支持」⇒ 永久放弃）；
+	// 且 `resetSignalStream`（重连/换流）时清零，下次重连可再试。
+	peersUnsupported atomic.Bool
+
+	// ⭐ P2SP 阶段 1b：打洞会话管理器 + 直连自签证书
+	//
+	// punchMu 只保护「指针/证书」这几个字段本身；打洞会话内部的并发
+	// 由 punchManager 自己的锁与「状态迁移单 goroutine」保证（见 punch.go 头注释）。
+	punchMu    sync.Mutex
+	punchMgr   *punchManager
+	directCert *tls.Certificate
+	directFP   string
+	// pendingP2PStatus 在管理器启动之前设置的处理器（Connect 时补挂）
+	pendingP2PStatus func(P2PStatus)
+
+	// ⭐ P2SP 阶段 1b-2A：直连路径管理（触发/路由/切换/回切）
+	//   同样受 punchMu 保护（生命周期与 punchMgr 一致：P2P 生效时建，Close 时停）
+	pathMgr *pathManager
+
+	// lastRelayRTT 中继 RTT（ns，由心跳 RTT 更新），供「直连 vs 中继」对比显示
+	lastRelayRTT atomic.Int64
+
+	// natRefreshMu 串行化「NAT 重探测 + 重新登记」（1b-2A：地址变化后重试用）
+	natRefreshMu sync.Mutex
+
 	serverIP   string
 	port       int
 	portVPN    int
@@ -501,6 +561,13 @@ type Hysteria2Client struct {
 	staticMask string
 	mu         sync.Mutex
 	connected  bool
+
+	// ⭐ 1b-4 第 2 步-A：对端质量表（内存 + 进程内 TTL，不落盘）。
+	//
+	// ⚠️ 生命周期契约：**唯一 new 点是 NewHysteria2Client**（见该函数），
+	// 跨重连存活 ⇒ 「重连不清空」。Connect/cleanupPartial/stopPunchManager **一律不得重置**
+	// （Connect 里已有 health.Reset()，**不要**照抄给这个字段加 Reset）。
+	quality *peerTable
 
 	skipCertVerify bool
 	serverCertMode string
@@ -563,6 +630,21 @@ type Hysteria2Client struct {
 	lastPingSentAt time.Time
 	lastRTT        time.Duration
 	lastRTTAt      time.Time
+
+	// ⭐ 新增（P2SP 阶段 0）
+	//
+	// p2pLocalEnabled  本机开关（来自 ClientConfig.P2PEnabled，默认 false）
+	// p2pServerEnabled 服务端开关（DHCP 应答第 11 段，旧服务端恒为 false）
+	// 两者都为真时才认为 P2P 真正启用 —— 服务端与客户端各自都保留否决权。
+	p2pLocalEnabled  bool
+	p2pServerEnabled bool
+
+	natOnce   sync.Once
+	natMu     sync.RWMutex
+	natResult NATProbeResult
+	// builtinSTUNPorts 服务端内置 STUN 端点端口（DHCP 第 12 段；为空表示服务端没开）
+	builtinSTUNPorts []int
+	natReady         bool
 }
 
 func NewHysteria2Client(serverIP string, port, portVPN int, username, password string,
@@ -579,6 +661,9 @@ func NewHysteria2Client(serverIP string, port, portVPN int, username, password s
 		portVPN = 8444
 	}
 
+	// ⭐ 1b-4 第 2 步-A：`quality: newPeerTable()` 是**对端质量表的唯一 new 点**。
+	//    ⚠️ 绝不要在 startPunchManager / Connect / cleanupPartial 里重建 ——
+	//    「重连不清空」这条拍板约束的唯一保证点就是这一行（见实施计划 §9.2.1）。
 	return &Hysteria2Client{
 		ctx:             ctx,
 		cancel:          cancel,
@@ -602,6 +687,7 @@ func NewHysteria2Client(serverIP string, port, portVPN int, username, password s
 		staticMask:      staticMask,
 		skipCertVerify:  skipCertVerify,
 		health:          NewHealthTracker(),
+		quality:         newPeerTable(),
 		tunWriteChan:    make(chan []byte, 512),
 		tcpSendChan:     make(chan []byte, 512),
 		matchSendChan:   make(chan []byte, 512),
@@ -621,6 +707,314 @@ func (c *Hysteria2Client) SetObfs(enabled bool, password string) {
 // ⭐ IsObfsEnabled 供 UI 查询
 func (c *Hysteria2Client) IsObfsEnabled() bool {
 	return c.obfsEnabled
+}
+
+// ========== P2SP 阶段 0：P2P 开关与 NAT 探测 ==========
+
+// SetP2P 设置本机 P2P 开关（来自 ClientConfig.P2PEnabled）。
+//
+// 连接前调用时只记值；连接后调用会**立即生效**（关掉时清空路由并关闭直连路径），
+// 因为内部走 ApplyP2PLocal（详见那里对开/关两种切换的语义说明）。
+func (c *Hysteria2Client) SetP2P(enabled bool) {
+	c.ApplyP2PLocal(enabled)
+}
+
+// P2PLocalEnabled 本机开关
+func (c *Hysteria2Client) P2PLocalEnabled() bool { return c.p2pLocalEnabled }
+
+// P2PServerEnabled 服务端下发的开关（DHCP 应答第 11 段；旧服务端恒为 false）
+func (c *Hysteria2Client) P2PServerEnabled() bool { return c.p2pServerEnabled }
+
+// P2PEffective 是否真正启用 P2P。
+//
+// ⭐ 1b-2A（UI 块）：**服务端开关 && 本机开关**，两者都开才生效。
+//   - 服务端开关（DHCP 应答第 11 段）是权威：它关着，客户端连 NAT 探测都不做；
+//   - 本机开关（客户端「高级选项 → 禁用 P2P」）是**本机否决**：
+//     它关着时，即使服务端允许，本机也不打洞、不建直连（流量全走中继）。
+//
+// 运行期切换由 ApplyP2PLocal 处理（关掉时会立刻清空路由表并关闭已有直连路径）。
+func (c *Hysteria2Client) P2PEffective() bool {
+	return c.p2pServerEnabled && c.p2pLocalEnabled
+}
+
+// ApplyP2PLocal 设置本机 P2P 开关并**立即生效**（运行期切换用；连接前调用也安全）。
+//
+// 语义（与验收要求逐条对应）：
+//   - 开→关：清空路由表 + 关闭已有直连路径（流量立刻回中继）；
+//   - 关→开：**不主动触发**任何打洞，等流量驱动（下一个发给对端 VIP 的包）。
+func (c *Hysteria2Client) ApplyP2PLocal(enabled bool) {
+	c.punchMu.Lock()
+	changed := c.p2pLocalEnabled != enabled
+	c.p2pLocalEnabled = enabled
+	pm := c.pathMgr
+	c.punchMu.Unlock()
+
+	log.Printf("📡 [HARP] 本机 P2P 开关: %v（参与判定）", enabled)
+	if !changed {
+		return
+	}
+	if !enabled && pm != nil {
+		// 关掉：立刻摘掉所有路由并关闭路径（中继从未被拆掉，所以这是零等待切换）
+		pm.ClearAll("本机已禁用 P2P")
+		log.Printf("📴 [HARP] 本机已禁用 P2P：已清空路由表并关闭全部直连路径（流量回中继）")
+		return
+	}
+	if enabled {
+		log.Printf("🔗 [HARP] 本机已启用 P2P：等待流量驱动触发（不会主动对所有对端打洞）")
+	}
+}
+
+// controlledP2PEnabled 打洞是否被允许（= 服务端开关 && 本机开关）
+func (c *Hysteria2Client) controlledP2PEnabled() bool {
+	return c.P2PEffective()
+}
+
+// SetP2PStatusHandler 注册直连状态回调（app 层把它转成 Wails 事件 "p2p:status"）。
+//
+// ⚠️ 回调可能从**多个 goroutine**触发（会话 goroutine / 事件 goroutine），实现方需自行保证并发安全；
+// 回调里不要做耗时操作（会拖慢状态机）。
+func (c *Hysteria2Client) SetP2PStatusHandler(fn func(P2PStatus)) {
+	c.punchMu.Lock()
+	mgr := c.punchMgr
+	c.punchMu.Unlock()
+	if mgr == nil {
+		// 还没启动（未连接）：先记录下来，startPunchManager 时会补上
+		c.pendingP2PStatus = fn
+		return
+	}
+	mgr.setStatusHandler(fn)
+}
+
+// startPunchManager 建立并启动打洞管理器（Connect 时调用，幂等）
+func (c *Hysteria2Client) startPunchManager() {
+	c.punchMu.Lock()
+	defer c.punchMu.Unlock()
+	if c.punchMgr != nil {
+		return
+	}
+	mgr := newPunchManager(c)
+	if c.pendingP2PStatus != nil {
+		mgr.setStatusHandler(c.pendingP2PStatus)
+	}
+	c.punchMgr = mgr
+	mgr.start()
+
+	// ⭐ 1b-2A：直连路径管理器（触发 → 路由 → 切换 → 回切）。
+	//    与打洞管理器同生命周期；它自己不发包，只在「有流量要发给某个对端 VIP」时
+	//    触发一次打洞，成功后把该对端加入路由表（写协程按表分流）。
+	pm := newPathManager(c)
+	c.pathMgr = pm
+	pm.start()
+	mgr.setPathManager(pm)
+	// ⭐ 1b-4 第 2 步-A：把**同一张**质量表注入两个短生命周期管理器（只读引用，绝不重建）。
+	//    punchManager 写（会话结束）、pathManager 读（试用期长短 + 软跳过）。
+	//
+	// ⚠️ 这里**不能**调 `c.qualityTable()`：本函数已持有 `c.punchMu`，而那个方法也要取
+	//    `c.punchMu` ⇒ 自死锁（非重入互斥锁；1b-2A 在 `pathMgr` 上踩过同款，构建期测试直接超时）。
+	//    生产路径上该字段已由 `NewHysteria2Client` 建好；这里只对「测试手工构造的 client」兜底。
+	tbl := c.quality
+	if tbl == nil {
+		tbl = newPeerTable()
+		c.quality = tbl
+	}
+	mgr.setQualityTable(tbl)
+	pm.setQualityTable(tbl)
+	log.Printf("📡 [打洞] 打洞管理器已启动（P2P 生效=%v，直连路径管理已启用）", c.P2PEffective())
+}
+
+// stopPunchManager 关闭打洞管理器与直连路径管理器（Close / cleanupPartial 调用，幂等）
+func (c *Hysteria2Client) stopPunchManager() {
+	c.punchMu.Lock()
+	mgr := c.punchMgr
+	pm := c.pathMgr
+	c.punchMgr = nil
+	c.pathMgr = nil
+	c.punchMu.Unlock()
+	// ⚠️ 顺序：先停路径管理（清空路由表 → 写协程立刻回中继），再停打洞会话
+	if pm != nil {
+		pm.close()
+		log.Printf("📴 [HARP] 直连路径管理已停止（所有路径已关闭）")
+	}
+	if mgr != nil {
+		mgr.close()
+		log.Printf("📴 [打洞] 打洞管理器已停止")
+	}
+}
+
+// pathManagerOrNil 取当前路径管理器（未连接/P2P 关闭时为 nil）
+func (c *Hysteria2Client) pathManagerOrNil() *pathManager {
+	c.punchMu.Lock()
+	defer c.punchMu.Unlock()
+	return c.pathMgr
+}
+
+// qualityTable 取对端质量表（**永不为 nil**：在 NewHysteria2Client 里 new）。
+//
+// ⚠️ 锁契约（review 追问 1 的全仓审计结论）：
+//   - 本方法是**唯一取 `c.punchMu`** 的取表入口；因此**调用方绝不能在持有 `punchMu` 的
+//     函数里调它** —— 那就是非重入锁自死锁（`startPunchManager` 踩过，见那里的注释）；
+//   - 反过来，`punchManager.qualityTable()` 与 `pathManager.qualityTable()` 都只是
+//     `atomic.Pointer.Load()`（**不取任何锁**）⇒ 它们可以在持锁上下文里安全调用。
+//     全仓审计（2026-09）：持 `punchMu` 而调取表入口的调用点 = **0 处**。
+//
+// ⚠️ 惰性兜底（`if c.quality == nil`）的定位：**只为覆盖「测试里手工 `&Hysteria2Client{}`」**。
+// 该分支在调用方的 `punchMu` 临界区内执行，所以两次 `new` 不会同时发生（指针写入受锁保护），
+// 但「A 建的表被 B 的 new 覆盖」在理论上可能（两者各自持有不同实例）。
+// 生产路径上 `c.quality` 由构造函数建好 ⇒ 该分支**永不触发**；
+// ⚠️ 因此也**明令禁止**任何代码把它置回 nil（那会让上述理论风险变成真风险）。
+func (c *Hysteria2Client) qualityTable() *peerTable {
+	c.punchMu.Lock()
+	defer c.punchMu.Unlock()
+	if c.quality == nil {
+		c.quality = newPeerTable()
+	}
+	return c.quality
+}
+
+// PunchTo 向指定对端 VIP 发起一次直连尝试（**异步**，结果通过状态回调/事件给出）。
+//
+// 返回 attemptId 用于日志关联；立即错误只覆盖「前置条件不满足」这一类。
+func (c *Hysteria2Client) PunchTo(peerVIP string) (string, error) {
+	c.punchMu.Lock()
+	mgr := c.punchMgr
+	c.punchMu.Unlock()
+	if mgr == nil {
+		// 区分三种「没有管理器」：本机否决 / 服务端没开 / 还没连上。
+		// 手工验证与用户排障时这三句话的差别很重要（要改的地方完全不同）。
+		return "", c.p2pUnavailableErr()
+	}
+	return mgr.PunchTo(peerVIP)
+}
+
+// PunchSessionState 查询某次尝试的当前状态（诊断/UI 用；找不到返回 "", false）
+func (c *Hysteria2Client) PunchSessionState(attemptID string) (string, bool) {
+	c.punchMu.Lock()
+	mgr := c.punchMgr
+	c.punchMu.Unlock()
+	if mgr == nil {
+		return "", false
+	}
+	mgr.mu.Lock()
+	s := mgr.sessions[attemptID]
+	mgr.mu.Unlock()
+	if s == nil {
+		return "", false
+	}
+	st, _ := s.state.Load().(string)
+	return st, true
+}
+
+// DirectFingerprint 本机直连证书指纹（诊断用；不存在时返回 ""）
+func (c *Hysteria2Client) DirectFingerprint() string {
+	c.punchMu.Lock()
+	defer c.punchMu.Unlock()
+	return c.directFP
+}
+
+// NATResult 返回 NAT 探测结果；Ready 为 false 表示尚未探测完成。
+func (c *Hysteria2Client) NATResult() (res NATProbeResult, ready bool) {
+	c.natMu.RLock()
+	defer c.natMu.RUnlock()
+	return c.natResult, c.natReady
+}
+
+// NATType 返回 NAT 类型标签；未探测完成时返回 unknown。
+func (c *Hysteria2Client) NATType() NATType {
+	res, ready := c.NATResult()
+	if !ready {
+		return NATUnknown
+	}
+	return res.Type
+}
+
+// noteNATReprobed 本机 NAT 重探测**成功**（拿到了新的公网地址）时调用（pathHost 接口方法）。
+//
+// ⭐ 1b-4 第一步 第 2 条重置：本机公网地址变了 ⇒ 之前所有对端的失败原因
+// （punch-timeout / nat-symmetric / peer-no-punch-addr）都可能不再成立，
+// 所以清掉**全部**对端的失败记录，让它们下一轮从第 0 档重试。
+//
+// ⚠️ 锁契约：只取 pathMgr 的 punchMu（短暂）与 pathManager 自己的 m.mu（在 resetAllBackoff 内）；
+//
+//	不做 I/O、不回调，调用点在调度器 goroutine 上（打洞尝试内部），不会拖慢热路径。
+func (c *Hysteria2Client) notifyNATReprobed() {
+	pm := c.pathManagerOrNil()
+	if pm == nil {
+		return
+	}
+	pm.ResetBackoffAll("本机 NAT 重探测成功，公网地址已更新")
+}
+
+// noteAssignedIP 记录隧道地址；**地址变化**时清掉全部对端失败记录。
+//
+// ⭐ 1b-4 第一步 第 3 条重置（VIP 变更）：VIP 是直连的路由键与仲裁依据，
+// 换了 VIP ⇒ 旧的路由/仲裁/失败记录全部作废（重连时通常同时发生）。
+//
+// ⚠️ 锁契约：只取 punchMu（取 pathMgr 引用）+ pathManager 的 m.mu；无 I/O。
+func (c *Hysteria2Client) noteAssignedIP(ip string) {
+	if ip == "" || ip == c.assignedIP {
+		return
+	}
+	c.assignedIP = ip
+	pm := c.pathManagerOrNil()
+	if pm == nil {
+		return
+	}
+	pm.ResetBackoffAll("本机隧道地址(VIP)变更：" + ip)
+}
+
+// NATPublicAddr 返回探测到的公网地址 "ip:port"；未探测完成时为空。
+func (c *Hysteria2Client) NATPublicAddr() string {
+	res, ready := c.NATResult()
+	if !ready {
+		return ""
+	}
+	return res.PublicAddr
+}
+
+// startNATDetection 异步探测 NAT 类型。
+//
+// ⭐ 约束（任务书 0.1）：
+//   - 只用临时 UDP socket，绝不复用 sharedUDPConn；
+//   - 不阻塞连接流程（放到 goroutine 里，失败只记日志）；
+//   - P2P 未启用时**完全跳过**（不发任何 STUN 包），
+//     这样「关掉 P2P 时行为与以前一模一样」。
+func (c *Hysteria2Client) startNATDetection() {
+	if !c.P2PEffective() {
+		log.Printf("🌐 [NAT] P2P 未启用（服务端开关=%v，本机开关=%v），跳过 NAT 探测",
+			c.p2pServerEnabled, c.p2pLocalEnabled)
+		return
+	}
+
+	c.natOnce.Do(func() {
+		go func() {
+			log.Println("🌐 [NAT] 开始探测 NAT 类型（临时 UDP socket，独立于隧道）...")
+
+			// 复用 dataCtx：Close()/cleanupPartial() 取消它，探测随之退出，
+			// 临时 socket 由 detectNAT 内部的 defer 关闭。
+			//
+			// ⭐ P2SP 阶段 1b-1 补丁：STUN 列表 = **服务端内置端点优先** + 公共 STUN 备选。
+			res := detectNAT(c.dataCtx, c.stunServerList())
+
+			c.natMu.Lock()
+			c.natResult = res
+			c.natReady = true
+			c.natMu.Unlock()
+
+			// ⭐ 验收要求：连接时打印这一行
+			log.Printf("🌐 [NAT] 类型: %s", res.Type)
+			if res.PublicAddr != "" {
+				log.Printf("🌐 [NAT] 公网地址: %s（映射端口=%v，STUN 响应=%d 台，映射与目的地址无关=%v）",
+					res.PublicAddr, res.ObservedPorts, res.RespondedServers, res.MappingIndependent)
+			}
+			if res.Err != nil {
+				log.Printf("🌐 [NAT] 探测未完整成功（已优雅降级，不影响连接）: %v", res.Err)
+			}
+
+			// ⭐ P2SP 阶段 1：拿到公网地址后把自己登记到服务端，
+			//    这样对端就能通过信令查到我的地址（失败只记日志）
+			c.registerSignalSelf()
+		}()
+	})
 }
 
 func (c *Hysteria2Client) markKicked(reason string) {
@@ -1013,6 +1407,21 @@ func (c *Hysteria2Client) Connect() (retIP string, retErr error) {
 			}
 		}
 
+		// ⭐ P2SP 阶段 0：第 11 段 = 服务端 P2P 开关（"on"/"off"）。
+		//    旧服务端只发 10 段 → parseP2PFlag 安全返回 false，
+		//    客户端行为与引入该功能之前完全一致（不会做 NAT 探测）。
+		c.p2pServerEnabled = parseP2PFlag(parts)
+		// ⭐ 1b-2A（UI 块）：本机开关**参与判定**（P2PEffective = 服务端 && 本机）
+		log.Printf("📡 [HARP] 服务端 P2P 开关: %v（本机开关: %v，参与判定）",
+			c.p2pServerEnabled, c.p2pLocalEnabled)
+
+		// ⭐ P2SP 阶段 1b-1 补丁：第 12 段 = 服务端内置 STUN 端点端口（"3478|3479" / "off"）。
+		//    国内公共 STUN 经常不可达，内置端点排到 STUN 列表首位可保证有观测点。
+		c.builtinSTUNPorts = parseBuiltinSTUNPorts(parts)
+		if len(c.builtinSTUNPorts) > 0 {
+			log.Printf("📡 [HARP] 服务端内置 STUN 端点: %v（将作为 STUN 列表首位）", c.builtinSTUNPorts)
+		}
+
 		if c.serverCertMode == "acme" {
 			if c.skipCertVerify {
 				log.Printf("⚠️ [客户端] 服务端使用 ACME 证书，但『跳过证书验证』已开启，安全性降低")
@@ -1045,7 +1454,10 @@ func (c *Hysteria2Client) Connect() (retIP string, retErr error) {
 		c.serverHostname = serverIPv4
 	}
 
-	c.assignedIP = ip
+	// ⭐ 1b-4 第一步 第 3 条重置（VIP 变更）：**必须在 startPunchManager 之前**调用 ——
+	//    它要拿的是「重启之前那个 pathManager」来清退避；而且这里也可能只是
+	//    「同一次连接里的 DHCP 续约拿到同一个 IP」⇒ noteAssignedIP 内部按值比较后 no-op。
+	c.noteAssignedIP(ip)
 	c.subnetMask = mask
 
 	tunDev, err := tun.CreateTUN("hy2-tun0", ip, mask, tunMTU)
@@ -1136,6 +1548,25 @@ func (c *Hysteria2Client) Connect() (retIP string, retErr error) {
 
 	c.health.Reset()
 
+	// ⭐ P2SP 阶段 0：NAT 类型探测（异步；P2P 未启用时直接跳过）
+	c.startNATDetection()
+
+	// ⭐ P2SP 阶段 1b：打洞管理器（推送处理 + 直连会话）。
+	// 只在 P2P 生效时启动：关闭时连队列和 goroutine 都不建。
+	if c.P2PEffective() {
+		c.startPunchManager()
+	}
+
+	// ⭐ P2SP 阶段 1：隧道内信令流（h3-ctrl 的第 4 条 stream）**不在这里开**。
+	//
+	// 两个原因（都是实打实的语义，不是风格问题）：
+	//  ① 信令流要求「登记自己」时就带上公网地址，而此刻 NAT 探测刚开始；
+	//  ② QUIC 里客户端开的流在**写入第一个字节之前对服务端不可见** ——
+	//     开完流不写，服务端会一直卡在 AcceptStream 上直到超时放弃，
+	//     之后就永远无法向这个客户端主动推送（打洞就废了）。
+	// 所以改由 NAT 探测完成后的 registerSignalSelf() 惰性建立，
+	// 开流后立刻写一帧 register（既登记、又让服务端看见这条流）。
+
 	go c.TunWriteLoop()
 	go c.tcpReceiveLoop(tcpStream)
 	go c.udpReceiveLoop(udpStream)
@@ -1165,6 +1596,20 @@ func (c *Hysteria2Client) Connect() (retIP string, retErr error) {
 
 	go c.heartbeatLoop(hbStream, preset.heartbeat)
 
+	// ⭐ D1-a：**握手成功后**清掉「服务端不支持 peers」的缓存（review 追问 2 的定稿选择）。
+	//
+	// 语义：该缓存的**作用域 = 一次连接**，不是客户端。同一个 `Hysteria2Client`
+	// 实例可以对**不同服务端**发起连接（用户切节点）；若把「旧服务端不支持」的结论
+	// 带过去 ⇒ 新服务端明明支持也永远不再试 ⇒ 功能永久失效（功能性 bug）。
+	//
+	// ⚠️ 为什么放在**握手成功后**而不是函数开头（定稿理由）：
+	//   - 放在开头 ⇒ 每次**失败的**重试也会清缓存 ⇒ 对「同一个不支持的服务端」反复
+	//     试错时，每次都白打一次 peers 往返（缓存等于失效）；
+	//   - 放在成功处 ⇒ 「失败重试」仍复用缓存（服务端没变，结论仍有效），
+	//     只有**真的换了一个连上的服务端**才清零 —— 既正确又省一次请求。
+	//   - 连接**失败**路径仍由 `cleanupPartial()` → `closeSignalStream()` 清零（双保险）。
+	c.peersUnsupported.Store(false)
+
 	// ⭐ 标记成功，禁用 defer 中的清理
 	success = true
 	return ip, nil
@@ -1174,6 +1619,12 @@ func (c *Hysteria2Client) Connect() (retIP string, retErr error) {
 // 幂等：可以安全地重复调用
 func (c *Hysteria2Client) cleanupPartial() {
 	log.Printf("🧹 [客户端] 连接未完成，清理残留资源...")
+
+	// ⭐ P2SP 阶段 1：关闭隧道内信令流
+	c.closeSignalStream()
+
+	// ⭐ P2SP 阶段 1b：停止打洞管理器（取消所有会话、释放 punch socket）
+	c.stopPunchManager()
 
 	// 数据面连接
 	if c.dataConn != nil {
@@ -1647,6 +2098,10 @@ func (c *Hysteria2Client) forwardData() {
 
 		proto := data[9]
 
+		// ⭐ 1b-2A 热路径钩子：把目的地址交给路径管理器（只做原子读 + map 查 + 非阻塞入队）。
+		//    「有流量要发给某个对端 VIP」就是打洞的触发条件（流量驱动，设计 §1.1）。
+		c.observeDst(data)
+
 		cp := make([]byte, len(data))
 		copy(cp, data)
 
@@ -1768,6 +2223,12 @@ func (c *Hysteria2Client) GameDatagramWriteLoop() {
 		case <-c.gameCtx.Done():
 			return
 		case pkt := <-c.gameUDPSendChan:
+			// ⭐ 1b-2A：不可靠 UDP 平面命中直连时走直连 datagram
+			//   （语义必须与中继一致：丢了就丢了、不重排、超限丢弃）
+			if dp := c.directDatagramPath(pkt); dp != nil {
+				dp.writeDatagram(pkt)
+				continue
+			}
 			if c.gameConn == nil {
 				continue
 			}
@@ -1832,13 +2293,27 @@ func (c *Hysteria2Client) ICMPWriteLoop() {
 	}
 }
 
+// ⭐ 1b-2A：5 个流平面的发送函数都先问一次「这个目的地址有直连吗」（§2.2）：
+//   - 有 → 投进**该平面对应流**的有界队列（非阻塞，满了丢这条流的包）；
+//   - 无 → 走中继（与 1b-1 逐字一致）。
+//
+// 直连的真实写发生在路径自己的写协程里，所以这里的阻塞风险为零（R1b 的隔离点）；
+// 平面→流的分组见 path.go 的 planeStream（关键小包与批量流量分属两条流即 Q1）。
 func (c *Hysteria2Client) sendTCPFrame(data []byte) error {
+	if ch := c.directSink(data, planeTCP); ch != nil {
+		enqueueDirect(ch, planeTCP, data)
+		return nil
+	}
 	c.tcpWriteMu.Lock()
 	defer c.tcpWriteMu.Unlock()
 	return writeFrameToStream(c.tcpStream, data)
 }
 
 func (c *Hysteria2Client) sendMatchFrame(data []byte) error {
+	if ch := c.directSink(data, planeMatch); ch != nil {
+		enqueueDirect(ch, planeMatch, data)
+		return nil
+	}
 	if c.matchStream == nil {
 		return fmt.Errorf("matchStream 未建立")
 	}
@@ -1848,6 +2323,10 @@ func (c *Hysteria2Client) sendMatchFrame(data []byte) error {
 }
 
 func (c *Hysteria2Client) sendGameTCPFrame(data []byte) error {
+	if ch := c.directSink(data, planeGameTCP); ch != nil {
+		enqueueDirect(ch, planeGameTCP, data)
+		return nil
+	}
 	if c.gameTCPStream == nil {
 		return fmt.Errorf("gameTCPStream 未建立")
 	}
@@ -1857,12 +2336,20 @@ func (c *Hysteria2Client) sendGameTCPFrame(data []byte) error {
 }
 
 func (c *Hysteria2Client) sendUDPFrame(data []byte) error {
+	if ch := c.directSink(data, planeUDP); ch != nil {
+		enqueueDirect(ch, planeUDP, data)
+		return nil
+	}
 	c.udpWriteMu.Lock()
 	defer c.udpWriteMu.Unlock()
 	return writeFrameToStream(c.udpStream, data)
 }
 
 func (c *Hysteria2Client) sendICMPFrame(data []byte) error {
+	if ch := c.directSink(data, planeICMP); ch != nil {
+		enqueueDirect(ch, planeICMP, data)
+		return nil
+	}
 	c.icmpWriteMu.Lock()
 	defer c.icmpWriteMu.Unlock()
 	return writeFrameToStream(c.icmpStream, data)
@@ -2123,7 +2610,9 @@ func (c *Hysteria2Client) gameConnStatsLoop() {
 	}
 }
 
-func writeFrameToStream(stream *quic.Stream, data []byte) error {
+// ⭐ 1b-2A：这两个分帧函数改成作用于**窄接口**直接流（`directStream`），
+// 于是中继的 *quic.Stream 与直连的流共用同一套分帧，不重复实现（见 path.go）。
+func writeFrameToStream(stream directStream, data []byte) error {
 	if len(data) > maxFrameSize {
 		return fmt.Errorf("帧过大: %d", len(data))
 	}
@@ -2134,7 +2623,7 @@ func writeFrameToStream(stream *quic.Stream, data []byte) error {
 	return err
 }
 
-func readFrame(stream *quic.Stream, buf []byte) ([]byte, error) {
+func readFrame(stream directStream, buf []byte) ([]byte, error) {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
 		return nil, err
@@ -2170,6 +2659,12 @@ func (c *Hysteria2Client) Close() error {
 		c.gameTCPCancel()
 		c.gameCancel()
 		c.ctrlCancel()
+
+		// ⭐ P2SP 阶段 1：关闭隧道内信令流
+		c.closeSignalStream()
+
+		// ⭐ P2SP 阶段 1b：停止打洞管理器（必须在关连接之前，让它先释放 punch socket）
+		c.stopPunchManager()
 
 		if c.dataConn != nil {
 			c.dataConn.CloseWithError(0, "")

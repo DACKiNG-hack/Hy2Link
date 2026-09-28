@@ -346,6 +346,42 @@ func (s *Store) AddTraffic(username string, delta uint64) {
 	}
 }
 
+// ResetTraffic 把某个账号的累计用量归零（管理员手动重置），返回归零**之前**的值。
+//
+// ⭐ 为什么必须有这个入口（P3 补丁的一部分）：
+//   - `UsedBytes` 是**持久化**的（写进 users.json），**没有任何自动归零**：
+//     既不是连接周期归零，也不是自然月归零；
+//   - 而认证（`authenticator`）与运行期复查（`manager/quota.go`）都以
+//     `UsedBytes >= MaxBytes` 判定「用尽」⇒ 一旦用尽且无法重置，用户就**永久进不来**。
+//     所以「踢人」与「重置」必须成对存在，否则踢人本身就是一个新 bug。
+//
+// 语义：
+//   - 只清 `UsedBytes`，不动 `MaxBytes` / `Enabled` / `ExpireAt`（三者是独立策略）；
+//   - **立即落盘**（不等 FlushLoop）：重置后若紧接着进程退出，管理员不该白高兴一场；
+//   - 写盘失败则**回滚内存值**并返回错误，保证「内存与磁盘一致」；
+//   - 幂等：已经是 0 时再重置也返回成功（prev=0）。
+func (s *Store) ResetTraffic(username string) (prev uint64, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	u, ok := s.userMap[username]
+	if !ok {
+		return 0, ErrUserNotFound
+	}
+	prev = u.UsedBytes
+	if prev == 0 {
+		return 0, nil
+	}
+
+	u.UsedBytes = 0
+	if err := s.saveLocked(); err != nil {
+		u.UsedBytes = prev // 回滚：不能让内存与磁盘不一致
+		return 0, err
+	}
+	s.dirty = false // 刚落过盘
+	return prev, nil
+}
+
 func (s *Store) FlushLoop(interval time.Duration, stop <-chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

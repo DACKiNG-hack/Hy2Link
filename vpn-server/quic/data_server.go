@@ -446,6 +446,25 @@ type DataChannelServer struct {
 	// ⭐ 安全审计 S1：数据面注册必须用认证阶段记录的身份来校验
 	auth *CustomAuthenticator
 
+	// ⭐ P2SP 阶段 1：隧道内信令
+	//
+	// ⚠️ p2pEnabled / signalReg 由 p2pMu 保护：EnableP2PSignal 可以在
+	// **运行期**被再次调用（面板关掉 P2P 开关），而 acceptSignalStream /
+	// signalReply 会在连接 goroutine 里读它们 —— 裸字段就是数据竞争。
+	// 读取一律走 p2pOn() / signalRegistry()。
+	p2pMu      sync.RWMutex
+	p2pEnabled bool
+	signalReg  *admin.SignalRegistry
+	// punch 是阶段 1b 的打洞协调表（独立结构，见 punch.go）；
+	// 与 signalReg 一样受 p2pMu 保护，关掉 P2P 时连同清理 goroutine 一起停掉。
+	punch *punchTable
+
+	// ⭐ D1-a：`peers` 请求的**每 VIP 滑动窗口限流**（键 = 请求方 VIP）。
+	// ⚠️ 与 punchTable.rate 同款实现，但**独立**（枚举比打洞更"重"，上限更严：1 次/分钟）。
+	// 必须按请求方计数，不能全局计数（否则一个客户端能把所有人限死）。
+	peersRateMu sync.Mutex
+	peersRate   map[string][]time.Time
+
 	serverTun *tun.TUNDevice
 	serverVIP [4]byte
 
@@ -584,6 +603,7 @@ func NewDataChannelServer(
 		gamePorts:          portMap,
 		udpMatchPorts:      matchMap,
 		udpUnreliablePorts: unrelMap,
+		peersRate:          make(map[string][]time.Time),
 	}
 	for i := 0; i < numShards; i++ {
 		s.shards[i] = &connShard{
@@ -591,6 +611,74 @@ func NewDataChannelServer(
 		}
 	}
 	return s
+}
+
+// EnableP2PSignal 注入隧道内信令所需的依赖（P2SP 阶段 1）。
+//
+// 用 setter 而不是继续往 NewDataChannelServer 上加位置参数：构造函数已经有
+// 9 个参数了。manager.Start 在 accept 循环启动**之前**调用它。
+//
+// ⭐ 运行期语义（面板把 p2pEnabled 从开改成关时）：
+//   - 新连接：不再接受第 4 条信令流（acceptSignalStream 直接返回）；
+//   - **已建立**的信令流：立即全部关闭并注销（CloseAllSinks），
+//     不是「留着但不再处理」—— 留一条半死的通道会让客户端以为自己
+//     还能打洞，而服务端又不再转发，问题会变得很难查。
+//     客户端读协程随即收到流结束，SignalQuery 之后会明确报错 → 回落中继。
+//   - 关掉再打开：登记表实例仍在（sinks 已清空），新连接可以重新挂载。
+//
+// 注意：面板改配置目前仍需**重启服务端**才生效（见 Manager.UpdateConfig），
+// 所以现实中这条路径等价于「重启 = 断开」；这里实现的是「若将来接上热切换，
+// 行为必须是这样」，并有测试覆盖。
+func (s *DataChannelServer) EnableP2PSignal(enabled bool, reg *admin.SignalRegistry) {
+	s.p2pMu.Lock()
+	oldReg := s.signalReg
+	oldPunch := s.punch
+	s.p2pEnabled = enabled
+	s.signalReg = reg
+	if enabled {
+		// 每次启用都换一张干净的表（旧表可能有残留 attempt）
+		s.punch = newPunchTable()
+	} else {
+		s.punch = nil
+	}
+	s.p2pMu.Unlock()
+
+	if !enabled {
+		// 在锁外关闭：CloseSignal / 停 ticker 都会做 I/O 或等 goroutine，不能持锁
+		if oldReg != nil {
+			oldReg.CloseAllSinks("服务端关闭了 P2P")
+		}
+		if oldPunch != nil {
+			oldPunch.close()
+		}
+	}
+
+	if enabled {
+		log.Printf("📡 [信令] 隧道内信令已启用（随 h3-ctrl 的第 4 条 stream 提供）")
+	} else {
+		log.Printf("📡 [信令] 隧道内信令未启用（P2P 关闭），不接受信令流")
+	}
+}
+
+// p2pOn 读 P2P 开关（并发安全）
+func (s *DataChannelServer) p2pOn() bool {
+	s.p2pMu.RLock()
+	defer s.p2pMu.RUnlock()
+	return s.p2pEnabled
+}
+
+// signalRegistry 读登记表（并发安全）
+func (s *DataChannelServer) signalRegistry() *admin.SignalRegistry {
+	s.p2pMu.RLock()
+	defer s.p2pMu.RUnlock()
+	return s.signalReg
+}
+
+// punchTable 读打洞协调表（并发安全）
+func (s *DataChannelServer) punchTable() *punchTable {
+	s.p2pMu.RLock()
+	defer s.p2pMu.RUnlock()
+	return s.punch
 }
 
 func (s *DataChannelServer) register(vipBytes [4]byte, cs *clientStream) {
@@ -616,13 +704,68 @@ func (s *DataChannelServer) lookup(vipBytes [4]byte) (*clientStream, bool) {
 	return cs, ok
 }
 
-func (s *DataChannelServer) unregisterData(vipBytes [4]byte, cs *clientStream) bool {
+// ensureOnline 维护"在线状态"（`AdminState` 条目）—— **两条分支共用**（新建 / 接管复用）。
+//
+// ⚠️ 命名（review 提醒 1）：叫 `ensure*` 而不是 `touch*`/`upsert*` —— 它**既会新建也会更新**
+//
+//	（底层 `AdminState.OnConnect` 是 upsert：不存在则建、存在则更新并保留计数）。
+//	"touch" 会让人误以为"只更新已存在的条目"。
+//
+// ⚠️ 2026-09-28（面板趋势图 bug · 修法 2 的调用面）：本函数必须由 `handleBulkDataConn` 的
+// **两条分支之外**调用，**不能**只放在"新建 `clientStream`"的分支里。
+//
+//	为什么：若只管新建分支，则"**接管 + 身份相符（复用既有流）**"这条路径**不会维护条目** ⇒
+//	一旦该 VIP 的条目此前已丢失（陈旧收尾误删 / 早期竞态），它就**永远不会被补回来**
+//	⇒ `AddTraffic` 静默丢弃 ⇒ "Σ 每客户端字节 = 0" ⇒ **面板趋势图恒 0**。
+//	这正是 A″（stale-stream 复用跳过 OnConnect）——本 bug 的**主触发链**。
+//
+// `AdminState.OnConnect` 已是 **upsert** 语义（修法 2）：同身份保留计数、刷新元数据与 `LastSeen`；
+//
+//	身份变化则视为新会话（防御第二道；第一道是 `handleBulkDataConn` 里的 X′ 拒绝复用）。
+//
+// 📌 抽出本函数的**额外好处**：它让"复用分支是否维护条目"变成**可单测的生产代码路径**，
+//
+//	而不是只能靠"测试体自己模拟调用"（那种写法是假守卫：注入"把调用退回新建分支"它照样绿 —— 已实测）。
+//	守卫：`quic/admin_state_takeover_test.go` 的 `TestTakeoverReuseRefreshesAdminEntry`。
+//
+// 📌 `realAddr` 由调用方传入（**不要在本函数里 `conn.RemoteAddr()`**）：这样测试可以传任意地址，
+//
+//	而不必构造一个"可解引用"的 `quic.Conn`（零值解引用会 panic）。
+func (s *DataChannelServer) ensureOnline(cs *clientStream, realAddr string) {
+	if s.adminState == nil || cs == nil {
+		return
+	}
+	// ⭐ 在线列表按 **VIP**（每连接唯一）作键，而不是用户名 ——
+	//    否则同一账号被多个客户端共用时会互相覆盖。
+	s.adminState.OnConnect(cs.vip, cs.username, cs.mode, cs.vip, realAddr)
+}
+
+// unregisterData 摘除登记，**仅当"当前登记的数据连接仍是 `myDataConn`"** 时执行。
+//
+// ⚠️ 2026-09-28（面板趋势图 bug · 修法 1）：判据从"`cur != cs`"改为"**当前 `cur` 的 `dataConn`
+// 仍是 `myDataConn`**"。
+//
+//	为什么必须改：`cs` 是**可被接管复用的对象** —— 同一 VIP 的新数据连接会走"复用分支"
+//	（`handleBulkDataConn` 里 `cs.setBulkStreams(newConn, …)`），此时 `shard.conns[vip]` 与
+//	"旧连接手里的 `cs`"**是同一个指针** ⇒ 用 `cs` 作身份判据**无法区分新旧连接** ⇒
+//	旧连接的**陈旧收尾**会 `delete` 掉新流刚建立的条目（`OnDisconnect`）⇒
+//	`AdminState` 条目缺失 ⇒ "Σ 每客户端字节 = 0" ⇒ **面板趋势图恒 0**。
+//
+//	`myDataConn` 是"**登记时那条数据连接的标识**"（生产里就是 `*quic.Conn` 指针本身）：
+//	每条连接各自持有它，且 `dataConn` 的唯一写入点是 `setBulkStreams`（接管时必刷新）⇒ 判据可靠。
+//	（测试夹具用独立的小对象当标识，避免构造未初始化的 `quic.Conn`；见 `testConn`。）
+func (s *DataChannelServer) unregisterData(vipBytes [4]byte, myDataConn *quic.Conn) bool {
 	idx := getShardIndex(vipBytes)
 	shard := s.shards[idx]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	cur, ok := shard.conns[vipBytes]
-	if !ok || cur != cs {
+	if !ok {
+		return false
+	}
+	// ⚠️ 身份判据：**当前这条登记的数据连接必须仍是我这条**。
+	//	（不能比较 `cur != cs`：接管复用时那仍是同一个 `cs`。）
+	if cur.getDataConn() != myDataConn {
 		return false
 	}
 	delete(shard.conns, vipBytes)
@@ -763,20 +906,9 @@ func (s *DataChannelServer) handleDataConn(conn *quic.Conn) {
 	//   - 无混淆时任何人不需要口令就能入网；
 	//   - 注册别人的 VIP 会覆盖对方的 cs.tcpStream → 完整劫持；
 	//   - mode 自报为 single 就不计流量 → 配额形同虚设。
-	// 现在必须用服务端在认证阶段记录的身份来校验：
-	// peerIP 来自 QUIC 连接（不可伪造），username 必须对应一个刚从该 IP
-	// 认证成功的会话，vip 必须是服务端真的租出过、且未被其他会话占用的地址。
-	if s.auth == nil {
-		log.Printf("❌ [服务端] 认证器未初始化，拒绝数据面注册")
-		ctrlStream.Close()
-		conn.CloseWithError(0, "authorizer unavailable")
-		return
-	}
 	peerIP := peerIPOf(conn)
-	serverMode, authorized := s.auth.AuthorizeDataPlane(peerIP, username, vipStr)
+	serverMode, authorized := s.authorizePlane(connType, peerIP, username, vipStr)
 	if !authorized {
-		log.Printf("🚫 [安全] 拒绝未授权的数据面注册: type=%s peer=%s user=%q vip=%q",
-			connType, peerIP, username, vipStr)
 		ctrlStream.Close()
 		conn.CloseWithError(0, "unauthorized")
 		return
@@ -802,6 +934,33 @@ func (s *DataChannelServer) handleDataConn(conn *quic.Conn) {
 		ctrlStream.Close()
 		conn.CloseWithError(0, "unknown conn type")
 	}
+}
+
+// authorizePlane 校验某个「面」的注册帧身份（安全审计 S1）。
+//
+// ⭐ h3-data 的 4 个面与 h3-ctrl 都必须过这一关。
+// 背景：h3-data / h3-ctrl 这两条连接**从不经过 hy-core 的认证器**，
+// 它们只靠一帧明文注册信息声明自己是谁。因此服务端必须用
+// 「认证阶段留下的授权记录 + QUIC 对端 IP」来核对：
+//   - peerIP 来自 QUIC 连接，客户端无法伪造；
+//   - username 必须有一次未过期的成功认证（用户名:密码 由 hy-core 校验）；
+//   - vip 必须是服务端真通过 DHCP 租出过、且未被别的身份占用的地址。
+//
+// ⚠️ 历史教训：最初 S1 只覆盖了 h3-data（走 handleDataConn），
+// 漏掉了走 HandleCtrlConn 的 h3-ctrl。那会让未认证的连接直接
+// 用别人的 VIP 注册控制面，从而覆盖对方的 ctrl 面、以对方身份
+// 注入 ICMP 并窃取对方 ICMP 回复。两条入口现在共用这一个函数。
+func (s *DataChannelServer) authorizePlane(plane, peerIP, username, vipStr string) (mode string, ok bool) {
+	if s.auth == nil {
+		log.Printf("❌ [服务端] 认证器未初始化，拒绝 %s 面注册", plane)
+		return "", false
+	}
+	mode, ok = s.auth.AuthorizeDataPlane(peerIP, username, vipStr)
+	if !ok {
+		log.Printf("🚫 [安全] 拒绝未授权的 %s 面注册: peer=%s user=%q vip=%q",
+			plane, peerIP, username, vipStr)
+	}
+	return mode, ok
 }
 
 // peerIPOf 提取 QUIC 连接的对端 IP（不可被客户端伪造）
@@ -862,11 +1021,45 @@ func (s *DataChannelServer) handleBulkDataConn(
 	}
 
 	cs, ok := s.lookup(vipBytes)
+
+	// ⭐ 2026-09-28（面板趋势图 bug · 修法 X′）：**身份不符 ⇒ 不得接管既有流**。
+	//
+	// 为什么要拒：既有 `clientStream` 的身份字段（`username/mode/peerIP`）**只在其字面量里写过一次**
+	// （全仓没有 `cs.username = …`）⇒ 直接 `setBulkStreams` 接管会**继承旧身份**：
+	//   · 流量被记到**别人的账号**（`recordTraffic` 用 `cs.username`）⇒ 配额/计费串号；
+	//   · 在线面板显示**别人的用户名**；
+	//   · `AdminState` 的 upsert 会把两个客户端的数据混在一起。
+	// 触发场景：旧连接被杀（无 FIN）⇒ `shards.conns[vip]` 仍指旧 cs ⇒ 该 VIP 被回收给**别的设备**
+	// 后新设备连进来 ⇒ `lookup` 命中旧 cs。
+	//
+	// ⚠️ **顺序纪律（review 追问 A）**：必须**先 `unregisterData`、后 `closeAll`**。
+	//	反了的话：`closeAll` 触发旧连接的 defer → `cleanupDataConnVIP` → 此时 `cur == cs`
+	//	⇒ `unregisterData` 返回 true ⇒ **`OnDisconnect` 会把条目删掉**（"上边补、下边漏"）。
+	//	先摘登记 ⇒ 旧连接收尾时 `cur` 已不是它（或为空）⇒ 必然早退 ⇒ 不删。
+	//
+	// ⚠️ 已知代价（记账）：`peerIP` 变化（同设备换网络 4G↔WiFi）也会被判为"身份不符" ⇒
+	//	该客户端会以**新会话**出现（面板显示"重新上线"）。这是**如实**的（服务端可见的对端地址确实变了），
+	//	但用户可能误解 ⇒ 记账为观察项；若将来要"同设备复用"，需把 `deviceID` 下传到数据面（独立切片）。
+	if ok && cs != nil && (cs.username != username || cs.peerIP != peerIP) {
+		log.Printf("⚠️ [服务端] VIP %s 的既有数据面属于 %q（peer=%s），新连接 %q（peer=%s）不得接管"+
+			"⇒ 丢弃旧流并按新身份重建（避免流量/身份串号）",
+			vipStr, cs.username, cs.peerIP, username, peerIP)
+		s.unregisterData(vipBytes, cs.getDataConn()) // ① 先摘登记（按"当前登记的 conn"判据）
+		cs.closeAll("identity mismatch on takeover") // ② 再关旧流（其收尾将因 cur 已变而早退）
+		cs, ok = nil, false                          // ③ 强制走"新建"分支
+	}
+
 	if ok {
 		// ⭐ 安全审计 S10：同一 VIP 重复注册时，先关掉旧 dataConn 再替换流指针。
 		// 否则两条连接会同时向同一个 clientStream 写入，
 		// 造成 QUIC 流上帧交错、数据损坏；旧连接的 deferred 清理也
 		// 会因为 unregisterData 的 cur != cs 检查而正确地不再释放 IP。
+		//
+		// ⚠️ 覆盖缺口（review 追问 C，2026-09-28 留档）：**本 X′ 分支目前没有"走完整入口"的用例** ——
+		//	`handleBulkDataConn` 需要真实 `*quic.Conn`，而本仓服务端测试**没有 QUIC 握手夹具**
+		//	（`newSignalTestServer` 造的是"无 conn 的假流"）。现有的 `quic/admin_state_takeover_test.go`
+		//	覆盖的是**它调用的生产函数**（`ensureOnline` / `cleanupDataConnVIP` / `unregisterData`），
+		//	**不含**这里的身份判据与"先摘登记后关流"的顺序。⇒ 若要补齐，需先建"真连接测试夹具"（独立小切片）。
 		if old := cs.getDataConn(); old != nil && old != conn {
 			_ = old.CloseWithError(0, "replaced by new data conn")
 		}
@@ -882,32 +1075,31 @@ func (s *DataChannelServer) handleBulkDataConn(
 		}
 		cs.setBulkStreams(conn, tcpStream, udpStream)
 		s.register(vipBytes, cs)
-		if s.adminState != nil {
-			// ⭐ 在线列表按 **VIP**（每连接唯一）作键，而不是用户名 ——
-			//    否则同一账号被多个客户端共用时会互相覆盖。
-			s.adminState.OnConnect(vipStr, username, mode, vipStr, conn.RemoteAddr().String())
-		}
 		log.Printf("✅ bulk 数据面已建立: %s (mode=%s, 在线 %d)", username, mode, s.count())
 	}
+
+	// ⭐ 2026-09-28（面板趋势图 bug · 修法 2 的调用面）：**两条分支都必须维护在线状态**。
+	//
+	// 为什么必须放在 if/else 之外：本调用原先**只在"新建 clientStream"分支**里 ⇒
+	//   · 首次连接：条目建立 ✅
+	//   · **接管 + 身份相符（复用既有流）**：**不建条目** ⇒ 若该 VIP 的条目此前已丢失
+	//     （陈旧收尾误删 / 启动早期竞态），它就**永远不会被补回来** ⇒ `AddTraffic` 静默丢弃
+	//     ⇒ "Σ 每客户端字节 = 0" ⇒ **面板趋势图恒 0**（A″ 的"跳过 OnConnect"这一半）。
+	//   ⇒ 这正是本 bug 的主触发链：**stale-stream 复用跳过 OnConnect**。
+	//
+	// `AdminState.OnConnect` 已是 **upsert** 语义（修法 2）：
+	//   · 同身份 ⇒ **保留 `BytesIn/BytesOut`**、刷新元数据与 `LastSeen`、不动 `Connected`；
+	//   · 身份变化 ⇒ 视为新会话、计数归零（防御第二道；第一道是上面的 X′ 拒绝复用）。
+	//   ⇒ 因此"复用分支也调 OnConnect"**不会**让面板数字倒退、也**不会**混身份。
+	// ⭐ 2026-09-28（面板趋势图 bug · 修法 2 的调用面）：**维护在线状态** —— 抽成 `ensureOnline`
+	//	并由**两条分支共用**（见函数注释：为什么不能只放在"新建"分支里）。
+	s.ensureOnline(cs, conn.RemoteAddr().String())
 
 	s.goSafe("readTCPStream", func() { s.readTCPStream(tcpStream, cs) })
 	s.goSafe("readUDPStream", func() { s.readUDPStream(udpStream, cs) })
 
 	defer func() {
-		if s.unregisterData(vipBytes, cs) {
-			if s.ipAllocator != nil {
-				s.ipAllocator.ReleaseByVirtualIP(vipStr)
-			}
-			// ⭐ 安全审计 S1：只释放本连接占用的 VIP；
-			//    同一账号/同一出口 IP 下其它客户端的 VIP 不受影响。
-			if s.auth != nil {
-				s.auth.releaseSession(peerIP, username, vipStr)
-			}
-			if s.adminState != nil {
-				s.adminState.OnDisconnect(vipStr)
-			}
-			log.Printf("bulk 数据面断开: %s (在线 %d)", username, s.count())
-		}
+		s.cleanupDataConnVIP(vipBytes, vipStr, conn, username, peerIP)
 		// ⭐ 安全审计 S10：统一注销其余各个面，再关闭本地流。
 		// clearXxx 会先清就绪标志再置空指针，读者不会看到半更新状态。
 		cs.closeAll("data conn closed")
@@ -917,6 +1109,48 @@ func (s *DataChannelServer) handleBulkDataConn(
 	}()
 
 	<-conn.Context().Done()
+}
+
+// cleanupDataConnVIP 做「VIP 级」的连接收尾，返回是否真的执行了清理。
+//
+// ⚠️ 只有在**这条连接确实是该 VIP 当前占用者**时才清理（`unregisterData` 内部的
+// `cur != cs` 检查）：旧连接的 defer 跑时，新连接可能已经顶上来 —— 无条件清理会
+// 把**新会话**的 VIP 释放掉、并误删它的打洞协调记录（重连竞态）。
+//
+// ⭐ 抽成方法的原因：让上面那条防线可以被测试直接钉住
+// （`TestDropByVIPKeepsReplacedConnAttempts`），而不是只靠「代码长这样」。
+func (s *DataChannelServer) cleanupDataConnVIP(vipBytes [4]byte, vipStr string,
+	myDataConn *quic.Conn, username, peerIP string) bool {
+	// ⚠️ 修法 1（2026-09-28）：身份判据是 **`myDataConn`**（本连接自己的数据连接标识），不再是 `cs`。
+	//	`cs` 会被"接管复用"复用（新连接把流装到旧 `cs` 上）⇒ 用它无法区分新旧连接；
+	//	若陈旧收尾仍能通过判据，就会 `delete` 掉新流刚建立的 `AdminState` 条目（面板趋势图 bug 的成因之一）。
+	if !s.unregisterData(vipBytes, myDataConn) {
+		return false // 已被新连接顶掉（或本连接已不是当前登记）：什么都不做（重连竞态防线）
+	}
+	// ⭐ 1b-2B.2：清掉这个 VIP 的全部打洞协调记录。
+	//
+	// 打洞协调记录原本只靠 TTL(45s) 过期，而 peer-busy 的判据
+	// activeResponderCount(peerVIP) 是**记在响应方头上**的 ⇒ 发起方掉线后，
+	// 它留下的记录仍占着**对端**的名额，45s 内任何客户端打那个对端都可能被误判「忙」。
+	// 踢人（Kick/KickVIP）会关闭连接 ⇒ 同样走这条收尾路径，一并覆盖。
+	if pt := s.punchTable(); pt != nil {
+		if n := pt.dropByVIP(vipStr); n > 0 {
+			log.Printf("🧹 [打洞] %s 断开，清理其 %d 条协调记录（避免残留占对端名额）", vipStr, n)
+		}
+	}
+	if s.ipAllocator != nil {
+		s.ipAllocator.ReleaseByVirtualIP(vipStr)
+	}
+	// ⭐ 安全审计 S1：只释放本连接占用的 VIP；
+	//    同一账号/同一出口 IP 下其它客户端的 VIP 不受影响。
+	if s.auth != nil {
+		s.auth.releaseSession(peerIP, username, vipStr)
+	}
+	if s.adminState != nil {
+		s.adminState.OnDisconnect(vipStr)
+	}
+	log.Printf("bulk 数据面断开: %s (在线 %d)", username, s.count())
+	return true
 }
 
 // ⭐ 匹配面：独立连接，Cubic
@@ -1202,6 +1436,18 @@ func (s *DataChannelServer) handleCtrlConn(conn *quic.Conn) {
 	username := strings.TrimSpace(parts[2])
 	vipStr := strings.TrimSpace(parts[3])
 
+	// ⭐ 安全审计 S1（补齐）：控制面以前**没有**做身份校验 ——
+	// 未认证的连接只要猜到一个在线 VIP，就能注册控制面并覆盖对方的
+	// cs.ctrlConn/icmpStream/hbStream，从而以对方身份注入 ICMP、
+	// 窃取对方的 ICMP 回复、伪造对方的心跳与延迟。
+	// 现在与 h3-data 的 4 个面共用同一个校验。
+	peerIP := peerIPOf(conn)
+	if _, authorized := s.authorizePlane("ctrl", peerIP, username, vipStr); !authorized {
+		ctrlStream.Close()
+		conn.CloseWithError(0, "unauthorized")
+		return
+	}
+
 	parsedIP := net.ParseIP(vipStr)
 	if parsedIP == nil {
 		ctrlStream.Close()
@@ -1262,6 +1508,16 @@ func (s *DataChannelServer) handleCtrlConn(conn *quic.Conn) {
 
 	s.goSafe("readICMPStream", func() { s.readICMPStream(icmpStream, cs) })
 	s.goSafe("handleHeartbeatStream", func() { s.handleHeartbeatStream(hbStream, cs) })
+
+	// ⭐ P2SP 阶段 1：可选的**第 4 条** stream = 隧道内信令。
+	//
+	// 为什么放在这里：这条 stream 挂在已通过 S1 授权的 ctrl 连接上，
+	// 所以服务端手里就有 cs（含 cs.vip），信令的身份完全由服务端推导，
+	// 客户端不需要也不允许声明自己的 VIP。
+	//
+	// 关键：独立 goroutine + 自己的超时（见 acceptSignalStream），
+	// 旧客户端不会开第 4 条流 → 超时后安静退出，**不影响**上面 3 条面。
+	s.goSafe("acceptSignalStream", func() { s.acceptSignalStream(conn, cs) })
 
 	defer func() {
 		cs.clearCtrl()

@@ -104,6 +104,18 @@ func TestLoadPreservesExplicitlyEnabled(t *testing.T) {
 	}
 }
 
+// TestDefaultConfigP2PDisabled ⚠️ **已被取代（2026-09-28）**。
+//
+// 本用例原验证「P2SP 阶段 0：P2P 开关默认**关闭**」——该前提已被切片
+// **「服务端默认启用 HARP 直连」（方案 A：只改新部署默认）** 反转
+// ⇒ 现在由 `p2p_default_test.go` 的 **`TestDefaultConfigP2PEnabledByDefault`**（新部署默认 on）
+// 与 **`TestExplicitP2PFalseIsPreserved`**（显式 false 仍生效 ⇒ 已部署保持原样）取代。
+//
+// 保留本函数仅为**留痕指针**（不重复断言，避免"两份真相"）；不需要时可在下一轮删除文件级留痕。
+func TestDefaultConfigP2PDisabled(t *testing.T) {
+	t.Skip("已被 TestDefaultConfigP2PEnabledByDefault / TestExplicitP2PFalseIsPreserved 取代（2026-09-28 切片：服务端默认启用 HARP 直连）")
+}
+
 // TestValidateStillRequiresPortsWhenEnabled 开启时仍然必须填端口（行为未变）
 func TestValidateStillRequiresPortsWhenEnabled(t *testing.T) {
 	c := DefaultConfig()

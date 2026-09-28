@@ -100,9 +100,21 @@ func TestQUICDC_LossReduction(t *testing.T) {
 	after := cc.GetCongestionWindow()
 	t.Logf("丢包前: %d, 丢包后: %d", before, after)
 
-	// 应该降到 0.7 倍左右
-	if after > before*7/10 {
-		t.Errorf("cwnd 应降到 0.7 倍，实际 before=%d after=%d", before, after)
+	// 应该降到 lossReductionFactor 倍
+	//
+	// ⭐ 这里引用常量而不是写死 0.7：实现与测试曾经各写一个数
+	// （实现 0.85 / 测试 0.7）导致长期失败的假警报。
+	// 同时把「β 必须是 0.7」也钉住 —— 免得改常量的人以为测试会自动跟随。
+	if lossReductionFactor != 0.7 {
+		t.Fatalf("lossReductionFactor 应为 0.7（与 cubic.go/renoBeta 一致），实际 %v", lossReductionFactor)
+	}
+	want := quiccong.ByteCount(float64(before) * lossReductionFactor)
+	if after > want {
+		t.Errorf("cwnd 应降到 %v 倍（≤%d），实际 before=%d after=%d",
+			lossReductionFactor, want, before, after)
+	}
+	if after >= before {
+		t.Errorf("丢包后 cwnd 必须下降：before=%d after=%d", before, after)
 	}
 	if !cc.InRecovery() {
 		t.Error("丢包后应进入恢复状态")

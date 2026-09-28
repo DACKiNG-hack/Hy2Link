@@ -31,6 +31,21 @@ type HY2File struct {
 	ObfsEnabled    bool   `json:"obfsEnabled"`
 	ObfsPassword   string `json:"obfsPassword"`
 	SkipCertVerify bool   `json:"skipCertVerify"`
+
+	// P2PDisabled ⭐ 1b-4 第 3 步：本机「禁用 P2P」开关随配置一起分发。
+	//
+	// ⚠️ **不能加 omitempty**（这是刻意的）：
+	// 加了之后「启用（false）」在文件里会被省略，于是
+	//   ① 新版导出的「启用」配置 与 ② 旧版根本没有该字段的文件
+	// 在**文件层面无法区分**，将来排查「为什么这份配置没禁用 P2P」时无从判断来源。
+	// 显式输出 `"p2pDisabled": true|false` 让文件自描述。
+	//
+	// ⚠️ 兼容性（三方都成立，见 hyfile 的往返测试）：
+	//   - **旧文件缺该字段** ⇒ Go 零值 false ⇒ 「不禁用」= 默认行为（向后兼容）；
+	//   - **旧客户端读新文件** ⇒ 全仓无 DisallowUnknownFields ⇒ 忽略该字段、不报错（向前兼容）；
+	//   - 语义方向安全：`true` 只会让这份配置**不走直连（全走中继）**，不弱化任何加密/校验；
+	//     与 `skipCertVerify` 不同，**不需要**在解析时强制忽略。
+	P2PDisabled bool `json:"p2pDisabled"`
 }
 
 const (
@@ -131,6 +146,8 @@ func ExportToFile(cfg ClientConfig, path string) error {
 		ObfsEnabled:    cfg.ObfsEnabled,
 		ObfsPassword:   cfg.ObfsPassword,
 		SkipCertVerify: cfg.SkipCertVerify,
+		// ⭐ 1b-4 第 3 步：P2P 开关必须随配置导出（**不带 omitempty** ⇒ 恒出现 true/false）
+		P2PDisabled: cfg.P2PDisabled,
 	}
 	if f.Name == "" {
 		f.Name = cfg.IP
@@ -214,6 +231,10 @@ func ParseHyFile(path string) (*ClientConfig, error) {
 		// 降到「零 TLS 校验」，攻击者用自签证书就能完整中间人。
 		// 该开关只能由用户在本机 UI 上对某个连接显式开启。
 		SkipCertVerify: false,
+
+		// ⭐ 1b-4 第 3 步：P2P 开关**随文件导入**（与 skipCertVerify 相反，它不需要被忽略）。
+		// 旧版 .hy2 没有这个字段 ⇒ Go 零值 false ⇒ 「不禁用」= 默认行为（向后兼容）。
+		P2PDisabled: f.P2PDisabled,
 	}
 	return cfg, nil
 }

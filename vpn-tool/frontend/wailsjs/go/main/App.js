@@ -62,12 +62,36 @@ export function IsQuitting() {
   return window['go']['main']['App']['IsQuitting']();
 }
 
+export function P2PPaths() {
+  return window['go']['main']['App']['P2PPaths']();
+}
+
+export function P2PReasonText(arg1) {
+  return window['go']['main']['App']['P2PReasonText'](arg1);
+}
+
+export function P2PTrafficNote() {
+  return window['go']['main']['App']['P2PTrafficNote']();
+}
+
+export function PunchSessionState(arg1) {
+  return window['go']['main']['App']['PunchSessionState'](arg1);
+}
+
+export function PunchTo(arg1) {
+  return window['go']['main']['App']['PunchTo'](arg1);
+}
+
 export function QuitFromTray() {
   return window['go']['main']['App']['QuitFromTray']();
 }
 
 export function RegisterFileAssociation() {
   return window['go']['main']['App']['RegisterFileAssociation']();
+}
+
+export function SetP2PLocal(arg1) {
+  return window['go']['main']['App']['SetP2PLocal'](arg1);
 }
 
 export function SetQuitting(arg1) {
@@ -80,6 +104,14 @@ export function SetStartupArgs(arg1) {
 
 export function ShowWindowFromTray() {
   return window['go']['main']['App']['ShowWindowFromTray']();
+}
+
+export function SignalQuery(arg1) {
+  return window['go']['main']['App']['SignalQuery'](arg1);
+}
+
+export function SignalSelf() {
+  return window['go']['main']['App']['SignalSelf']();
 }
 
 export function Stop() {

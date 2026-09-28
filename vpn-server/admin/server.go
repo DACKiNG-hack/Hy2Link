@@ -138,6 +138,7 @@ func (s *Server) buildHandler() (http.Handler, error) {
 
 	mux.HandleFunc("/api/users", s.auth(s.handleUsers))
 	mux.HandleFunc("/api/users/", s.auth(s.handleUserByName))
+	mux.HandleFunc("/api/users/reset-traffic", s.auth(s.handleResetTraffic))
 	mux.HandleFunc("/api/clients", s.auth(s.handleClients))
 	mux.HandleFunc("/api/clients/kick", s.auth(s.handleKick))
 	mux.HandleFunc("/api/events", s.auth(s.handleEvents))
@@ -149,6 +150,12 @@ func (s *Server) buildHandler() (http.Handler, error) {
 	mux.HandleFunc("/api/cert/status", s.auth(s.handleCertStatus))
 	mux.HandleFunc("/api/cert/config", s.auth(s.handleCertConfig))
 	mux.HandleFunc("/api/cert/regenerate", s.auth(s.handleCertRegenerate))
+
+	// ⚠️ /api/signal/exchange 已删除（阶段 1）：
+	//    P2SP 信令已迁移到隧道内 —— 客户端在 h3-ctrl 连接上多开一条 stream，
+	//    由 vpn-server/quic 的控制面 handler 直接调用 admin.SignalRegistry。
+	//    这样既不需要把面板暴露给客户端（面板默认只监听 127.0.0.1），
+	//    也不需要为信令单独设计鉴权 —— 隧道内的身份由 S1 的授权给出。
 	if devMode {
 		dir := getStaticDir()
 		log.Printf("🔧 [DEV] 静态资源从磁盘读取: %s", dir)
@@ -694,6 +701,33 @@ func (s *Server) handleUserByName(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleResetTraffic 把某账号的累计用量归零（P3 补丁的恢复路径）。
+//
+// ⭐ 为什么必须有它：`UsedBytes` 是持久化的、且**没有自动归零**，
+// 而认证与运行期配额复查都以 `UsedBytes >= MaxBytes` 判「用尽」——
+// 没有重置入口的话，「按配额踢人」就等于把用户永久锁在门外。
+//
+// 语义：只清用量，不动配额/启用状态/到期时间（见 store.ResetTraffic）。
+func (s *Server) handleResetTraffic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	username := strings.TrimSpace(r.URL.Query().Get("username"))
+	if username == "" {
+		http.Error(w, `{"error":"missing username"}`, http.StatusBadRequest)
+		return
+	}
+	prev, err := s.users.ResetTraffic(username)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusNotFound)
+		return
+	}
+	// 审计：谁在什么时候把谁的用量清零了（重置是敏感操作）
+	log.Printf("♻️ [配额] 管理员重置用户 %s 的用量（原 %d 字节）", username, prev)
+	writeJSON(w, map[string]interface{}{"status": "ok", "username": username, "previousUsedBytes": prev})
 }
 
 // handleKick 踢出在线连接。
