@@ -95,11 +95,6 @@ wails build
 New-NetFirewallRule -DisplayName "HARP STUN" -Direction Inbound -Protocol UDP -LocalPort 3478,3479 -Action Allow
 ```
 
-**Linux**：
-```bash
-ufw allow 3478/udp && ufw allow 3479/udp
-```
-
 > 未放行不会断网（仍有流量驱动打洞 + 中继兜底），但直连可能无法建立。
 
 ## 配置说明
