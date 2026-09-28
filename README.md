@@ -2,7 +2,7 @@
 
 基于 Hysteria2 魔改 QUIC 的虚拟组网工具，为游戏对战和抗审查场景打造。
 
-内置 **HARP 直连**（Hy2Link Auto Relay Punch）—— 自动打洞，让对端之间直连，
+内置 **HARP 直连**（Hybrid Adaptive Routing Protocol）—— 自动打洞，让对端之间直连，
 不经服务器中转；打洞失败时自动回退中继，不断网。
 
 ## 特性
